@@ -631,7 +631,7 @@ function renderAdminReset(req, res, values = {}, message = "", category = "error
             ? ""
             : '<div class="form-error span-2">Reset is not enabled. Set ADMIN_RESET_CODE in Hostinger environment variables, or create tmp/admin-reset-code.txt with a one-time code.</div>'
         }
-        <label class="field span-2"><span>Admin login ID</span><input name="mobile" value="${esc(fieldValue(values, "mobile", ""))}" required></label>
+        <label class="field span-2"><span>Admin login ID</span><input name="mobile" value="${esc(fieldValue(values, "mobile", ""))}"><small>Optional. Leave blank to reset the first active admin.</small></label>
         <label class="field span-2"><span>Reset code</span><input name="reset_code" value="${esc(fieldValue(values, "reset_code", ""))}" required></label>
         <label class="field span-2"><span>New password</span><input name="password" type="password" required></label>
         <label class="field span-2"><span>Confirm password</span><input name="confirm_password" type="password" required></label>
@@ -659,15 +659,26 @@ app.post("/reset-admin", (req, res) => {
   }
   if (password.length < 6) return renderAdminReset(req, res, req.body, "Password must be at least 6 characters.");
   if (password !== confirmPassword) return renderAdminReset(req, res, req.body, "Passwords do not match.");
-  const admin = one("SELECT * FROM users WHERE mobile=? AND role='admin' AND status='Active'", [mobile]);
-  if (!admin) return renderAdminReset(req, res, req.body, "Active admin login ID not found.");
+  let admin = mobile ? one("SELECT * FROM users WHERE mobile=? AND role='admin' AND status='Active'", [mobile]) : null;
+  if (!admin) admin = one("SELECT * FROM users WHERE role='admin' AND status='Active' ORDER BY id LIMIT 1");
+  if (!admin && mobile) {
+    const created = run("INSERT INTO users(name, mobile, role, password_hash, status) VALUES(?,?,?,?,?)", [
+      "Emergency Admin",
+      mobile,
+      "admin",
+      hashWerkzeug(password),
+      "Active",
+    ]);
+    admin = one("SELECT * FROM users WHERE id=?", [created.lastInsertRowid]);
+  }
+  if (!admin) return renderAdminReset(req, res, req.body, "No active admin was found. Enter the login ID you want to create, then submit again.");
   run("UPDATE users SET password_hash=? WHERE id=?", [hashWerkzeug(password), admin.id]);
   if (resetConfig.source === "file") {
     try {
       fs.unlinkSync(resetConfig.filePath);
     } catch (_err) {}
   }
-  flash(req, "success", "Admin password reset. Login with the new password.");
+  flash(req, "success", `Admin password reset for login ID ${admin.mobile}. Login with the new password.`);
   res.redirect("/login");
 });
 
