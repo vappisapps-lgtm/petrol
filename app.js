@@ -2218,7 +2218,7 @@ app.route("/day/close")
       <label class="field"><span>HSD closing</span><input name="day_close_${p.pump_id}_HSD" type="number" step="0.001" value="${esc(p.hsd_closing)}" required></label>
     `).join("");
     res.send(layout(req, "Day Closing", `${pageHead("Day Closing", "Operations > Day Closing")}
-      <section class="stat-grid"><div class="stat"><span>Open shifts</span><strong>${esc(openCount)}</strong></div><div class="stat"><span>Sales</span><strong>${rs(metrics.totals.sales)}</strong></div><div class="stat"><span>Cash</span><strong>${rs(metrics.totals.cash)}</strong></div><div class="stat"><span>Credit</span><strong>${rs(metrics.totals.credit)}</strong></div></section>
+      <section class="stat-grid"><div class="stat"><span>Open shifts info</span><strong>${esc(openCount)}</strong><small>Day closing is independent</small></div><div class="stat"><span>Sales</span><strong>${rs(metrics.totals.sales)}</strong></div><div class="stat"><span>Cash</span><strong>${rs(metrics.totals.cash)}</strong></div><div class="stat"><span>Credit</span><strong>${rs(metrics.totals.credit)}</strong></div></section>
       <section class="form-card"><form method="post" class="grid-form" onsubmit="return confirm('Close this business day? New day openings will use these closing readings.');">
         ${closingInputs || '<div class="form-error span-2">Start the day and capture pump openings before day closing.</div>'}
         <div class="action-row"><button class="primary">Close Day</button></div>
@@ -2226,15 +2226,9 @@ app.route("/day/close")
   })
   .post(requireLogin, requireRoles("admin", "manager"), async (req, res) => {
     const day = await activeDay();
-    const openCount = (await one(
-      `SELECT COUNT(DISTINCT p.id) c
-       FROM shift_entries se JOIN nozzles n ON n.id=se.nozzle_id JOIN pumps p ON p.id=n.pump_id
-       WHERE se.day_id=? AND se.status='Open'`,
-      [day.id]
-    )).c;
-    if (openCount) {
-      flash(req, "error", "Close all open shifts before day closing.");
-      return res.redirect("/day/close");
+    if (!day) {
+      flash(req, "error", "No open day to close.");
+      return res.redirect("/");
     }
     const readings = await all(
       `SELECT p.id pump_id, n.id nozzle_id, n.product, dnr.opening_meter
