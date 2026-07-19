@@ -971,7 +971,8 @@ async function dashboardMetrics() {
   const day = await activeDay();
   const latestClosedDay = await previousClosedDay();
   const latestDayReport = latestClosedDay ? await dayReportRows(latestClosedDay.id) : null;
-  if (!day) return { day: null, latestClosedDay, latestDayReport };
+  const latestShiftWiseReport = latestClosedDay ? await shiftWiseSalesRows(latestClosedDay.id) : [];
+  if (!day) return { day: null, latestClosedDay, latestDayReport, latestShiftWiseReport };
   const totals = await one(
     `SELECT COALESCE(SUM(sales_amount),0) sales, COALESCE(SUM(cash),0) cash,
      COALESCE(SUM(upi),0) upi, COALESCE(SUM(card),0) card, COALESCE(SUM(credit),0) credit,
@@ -987,6 +988,7 @@ async function dashboardMetrics() {
     day,
     latestClosedDay,
     latestDayReport,
+    latestShiftWiseReport,
     totals,
     open_shifts: (await one(
       `SELECT COUNT(DISTINCT p.id) c
@@ -1330,12 +1332,14 @@ app.get("/", requireLogin, async (req, res) => {
   const metrics = await dashboardMetrics();
   if (!metrics.day) {
     const closedDayReport = renderDayReport(metrics.latestClosedDay, metrics.latestDayReport);
+    const closedShiftReport = renderShiftWiseSalesReport(metrics.latestClosedDay, metrics.latestShiftWiseReport);
     return res.send(
       layout(
         req,
         "Dashboard",
         `${pageHead(`Welcome Back, ${req.user.name}`, "Home > Dashboard")}
         ${closedDayReport || '<section class="table-card"><div class="table-card-head"><div><h2>Day Report</h2><p>No closed day report is available yet.</p></div></div><div class="empty-state"><h2>No closed day</h2><p>Close a business day to see the owner account report here.</p></div></section>'}
+        ${closedShiftReport}
         <section class="empty-state"><h2>No open business day</h2><p>Start a new business day when ready.</p><a class="primary link-button" href="/day/start">Start Day</a></section>`
       )
     );
@@ -1377,6 +1381,7 @@ app.get("/", requireLogin, async (req, res) => {
         <div class="panel"><div class="panel-title"><h2>Top Credit Customers</h2></div>${m.top_customers.map((c) => `<div class="ledger-line"><span>${esc(c.name)}</span><strong>${rs(c.balance)}</strong></div>`).join("") || '<p class="muted">No pending customer credit.</p>'}</div>
         <div class="panel wide"><div class="panel-title"><h2>Pump-wise Sales</h2></div>${tableColumns(m.pump_sales, ["pump", "salesperson", "login_id", "ms_litres", "hsd_litres", "sales"])}</div>
         ${renderDayReport(m.latestClosedDay, m.latestDayReport)}
+        ${renderShiftWiseSalesReport(m.latestClosedDay, m.latestShiftWiseReport)}
         <div class="panel wide"><div class="panel-title"><h2>Open Shift Records</h2><span class="badge">${esc(m.open_shifts)} open</span></div>${tableColumns(openEntries, ["business_date", "pump", "user_name", "ms_opening", "hsd_opening", "status"])}</div>
         <div class="panel wide"><div class="panel-title"><h2>Salesperson-wise Sales</h2></div>${tableColumns(m.boy_sales, ["person", "login_id", "pump", "ms_litres", "hsd_litres", "sales"])}</div>
       </section>`
@@ -1661,6 +1666,31 @@ function renderDayReport(day, rows) {
       <thead><tr><th>Pump</th><th>MS opening</th><th>MS closing</th><th>MS test</th><th>MS litres</th><th>MS sales (${esc(money(day.ms_price).toFixed(2))})</th><th>HSD opening</th><th>HSD closing</th><th>HSD test</th><th>HSD litres</th><th>HSD sales (${esc(money(day.hsd_price).toFixed(2))})</th><th>Total sales</th></tr></thead>
       <tbody>${rowHtml}<tr><td><strong>Total</strong></td><td></td><td></td><td><strong>${esc(fmtNum(totals.ms_test))}</strong></td><td><strong>${esc(fmtNum(totals.ms_litres))}</strong></td><td><strong>${esc(rs(totals.ms_sales))}</strong></td><td></td><td></td><td><strong>${esc(fmtNum(totals.hsd_test))}</strong></td><td><strong>${esc(fmtNum(totals.hsd_litres))}</strong></td><td><strong>${esc(rs(totals.hsd_sales))}</strong></td><td><strong>${esc(rs(totals.total_sales))}</strong></td></tr></tbody>
     </table></div></section>`;
+}
+
+async function shiftWiseSalesRows(dayId) {
+  return await all(
+    `SELECT se.business_date, sd.name shift, p.name pump, u.name salesperson, u.mobile login_id,
+     COALESCE(SUM(CASE WHEN se.product='MS' THEN se.litres_sold ELSE 0 END),0) ms_litres,
+     COALESCE(SUM(CASE WHEN se.product='MS' THEN se.sales_amount ELSE 0 END),0) ms_sales,
+     COALESCE(SUM(CASE WHEN se.product='HSD' THEN se.litres_sold ELSE 0 END),0) hsd_litres,
+     COALESCE(SUM(CASE WHEN se.product='HSD' THEN se.sales_amount ELSE 0 END),0) hsd_sales,
+     COALESCE(SUM(se.sales_amount),0) total_sales
+     FROM shift_entries se
+     JOIN shift_defs sd ON sd.id=se.shift_def_id
+     JOIN users u ON u.id=se.user_id
+     JOIN nozzles n ON n.id=se.nozzle_id
+     JOIN pumps p ON p.id=n.pump_id
+     WHERE se.day_id=? AND se.status='Closed'
+     GROUP BY se.business_date, sd.id, sd.name, p.id, p.name, u.id, u.name, u.mobile
+     ORDER BY se.business_date DESC, sd.start_time, ${pumpOrderSql("p")}, u.name`,
+    [dayId]
+  );
+}
+
+function renderShiftWiseSalesReport(day, rows) {
+  if (!day) return "";
+  return `<section class="table-card"><div class="table-card-head"><div><h2>Shift-wise Sales Report</h2><p>Sales by shift, pump and salesperson for ${esc(day.business_date)}.</p></div></div>${tableColumns(rows || [], ["business_date", "shift", "pump", "salesperson", "login_id", "ms_litres", "ms_sales", "hsd_litres", "hsd_sales", "total_sales"])}</section>`;
 }
 
 async function renderDayStart(req, res, values = {}, error = "") {
