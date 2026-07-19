@@ -992,22 +992,20 @@ async function dashboardMetrics() {
        WHERE se.day_id=? AND se.status='Open'`,
       [day.id]
     )).c,
-    tank_stock: await all("SELECT product, COALESCE(SUM(current_stock),0) stock FROM tanks GROUP BY product"),
     credit_pending: (await one("SELECT COALESCE(SUM(balance),0) b FROM customers WHERE status='Active'")).b,
     top_customers: await all("SELECT name, balance FROM customers WHERE balance>0 ORDER BY balance DESC LIMIT 5"),
-    pump_sales: await all(
-      `SELECT p.name pump, COALESCE(SUM(se.sales_amount),0) sales, COALESCE(SUM(se.litres_sold),0) litres
-       FROM pumps p
-       LEFT JOIN nozzles n ON n.pump_id=p.id
-       LEFT JOIN shift_entries se ON se.nozzle_id=n.id AND se.day_id=? AND se.status='Closed'
-       GROUP BY p.id, p.name ORDER BY p.name`,
-      [day.id]
-    ),
     boy_sales: await all(
-      `SELECT u.name, COALESCE(SUM(se.sales_amount),0) sales, COALESCE(SUM(se.litres_sold),0) litres
-       FROM users u JOIN shift_entries se ON se.user_id=u.id
+      `SELECT u.name person, u.mobile login_id, p.name pump,
+       COALESCE(SUM(CASE WHEN se.product='MS' THEN se.litres_sold ELSE 0 END),0) ms_litres,
+       COALESCE(SUM(CASE WHEN se.product='HSD' THEN se.litres_sold ELSE 0 END),0) hsd_litres,
+       COALESCE(SUM(se.sales_amount),0) sales
+       FROM users u
+       JOIN shift_entries se ON se.user_id=u.id
+       JOIN nozzles n ON n.id=se.nozzle_id
+       JOIN pumps p ON p.id=n.pump_id
        WHERE se.day_id=? AND se.status='Closed'
-       GROUP BY u.id, u.name ORDER BY sales DESC`,
+       GROUP BY u.id, u.name, u.mobile, p.id, p.name
+       ORDER BY sales DESC, u.name, ${pumpOrderSql("p")}`,
       [day.id]
     ),
     payment_totals: await all(
@@ -1354,13 +1352,11 @@ app.get("/", requireLogin, async (req, res) => {
             <article><strong>HSD sales</strong><span>${rs(m.totals.hsd_sales)}</span></article>
           </div>
         </div>
-        <div class="panel"><div class="panel-title"><h2>Stock Available</h2></div>${m.tank_stock.map((r) => `<div class="ledger-line"><span>${esc(r.product)}</span><strong>${ltr(r.stock)}</strong></div>`).join("")}</div>
-        <div class="panel"><div class="panel-title"><h2>Pump-wise Sales</h2></div>${m.pump_sales.map((r) => `<div class="ledger-line"><span>${esc(r.pump)}</span><strong>${rs(r.sales)}</strong></div>`).join("") || '<p class="muted">No pump sales yet.</p>'}</div>
         <div class="panel"><div class="panel-title"><h2>Payment Split</h2></div>${m.payment_totals.map((r) => `<div class="ledger-line"><span>${esc(r.payment_type || "Unsorted")}</span><strong>${rs(r.amount)}</strong></div>`).join("") || '<p class="muted">No shift payments logged yet.</p>'}</div>
         <div class="panel"><div class="panel-title"><h2>Top Credit Customers</h2></div>${m.top_customers.map((c) => `<div class="ledger-line"><span>${esc(c.name)}</span><strong>${rs(c.balance)}</strong></div>`).join("") || '<p class="muted">No pending customer credit.</p>'}</div>
         <div class="panel wide"><div class="panel-title"><h2>Day Opening Readings</h2><span class="badge">${esc(m.day.business_date)}</span></div>${table(openingRows)}</div>
         <div class="panel wide"><div class="panel-title"><h2>Open Shift Records</h2><span class="badge">${esc(m.open_shifts)} open</span></div>${tableColumns(openEntries, ["business_date", "pump", "user_name", "ms_opening", "hsd_opening", "status"])}</div>
-        <div class="panel wide"><div class="panel-title"><h2>Salesperson-wise Sales</h2></div>${tableColumns(m.boy_sales, ["name", "sales", "litres"])}</div>
+        <div class="panel wide"><div class="panel-title"><h2>Salesperson-wise Sales</h2></div>${tableColumns(m.boy_sales, ["person", "login_id", "pump", "ms_litres", "hsd_litres", "sales"])}</div>
       </section>`
     )
   );
