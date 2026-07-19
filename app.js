@@ -420,28 +420,6 @@ function adminResetConfig() {
   return null;
 }
 
-function cleanupGeneratedPumpSetup() {
-  const generated = all("SELECT * FROM pumps WHERE status='Active' AND name GLOB 'Pump [0-9]*' ORDER BY CAST(SUBSTR(name, 6) AS INTEGER)");
-  if (generated.length <= 2) return;
-  for (const pump of generated) {
-    const pumpNumber = Number(String(pump.name).replace("Pump ", ""));
-    if (!Number.isFinite(pumpNumber) || pumpNumber <= 2) continue;
-    const hasEntries = one(
-      `SELECT COUNT(*) c
-       FROM nozzles n
-       LEFT JOIN shift_entries se ON se.nozzle_id=n.id
-       LEFT JOIN day_nozzle_readings dnr ON dnr.nozzle_id=n.id
-       WHERE n.pump_id=? AND (se.id IS NOT NULL OR dnr.id IS NOT NULL)`,
-      [pump.id]
-    ).c;
-    const customNozzles = one("SELECT COUNT(*) c FROM nozzles WHERE pump_id=? AND name NOT IN (?,?)", [pump.id, `${pump.name} MS`, `${pump.name} HSD`]).c;
-    if (!Number(hasEntries) && !Number(customNozzles)) {
-      run("UPDATE nozzles SET status='Inactive' WHERE pump_id=?", [pump.id]);
-      run("UPDATE pumps SET status='Inactive' WHERE id=?", [pump.id]);
-    }
-  }
-}
-
 function ensureConfiguredPumpProducts() {
   const tankIds = {};
   for (const product of PRODUCTS) {
@@ -474,6 +452,59 @@ function ensureConfiguredPumpProducts() {
       }
     }
   }
+}
+
+function pumpOrderSql(alias = "p") {
+  return `CASE WHEN ${alias}.name GLOB 'Pump [0-9]*' THEN CAST(SUBSTR(${alias}.name, 6) AS INTEGER) ELSE 999999 END, ${alias}.name`;
+}
+
+function groupPumpEntries(entries) {
+  const grouped = new Map();
+  for (const e of entries) {
+    if (!grouped.has(e.pump_id)) {
+      grouped.set(e.pump_id, {
+        pump_id: e.pump_id,
+        business_date: e.business_date,
+        pump: e.pump,
+        user_name: e.user_name,
+        shift_name: e.shift_name,
+        ms_opening: "",
+        hsd_opening: "",
+        ms_closing: "",
+        hsd_closing: "",
+        status: e.status,
+      });
+    }
+    const row = grouped.get(e.pump_id);
+    if (e.product === "MS") {
+      row.ms_opening = e.opening_meter;
+      row.ms_closing = e.closing_meter ?? "";
+    }
+    if (e.product === "HSD") {
+      row.hsd_opening = e.opening_meter;
+      row.hsd_closing = e.closing_meter ?? "";
+    }
+  }
+  return Array.from(grouped.values());
+}
+
+function activePumpGroups(req) {
+  const where = req.user.role === "pump_boy" ? "AND se.user_id=?" : "";
+  const params = req.user.role === "pump_boy" ? [req.user.id] : [];
+  return groupPumpEntries(
+    all(
+      `SELECT se.id, se.business_date, p.id pump_id, p.name pump, se.product, u.name user_name, sd.name shift_name,
+       se.opening_meter, se.closing_meter, se.status
+       FROM shift_entries se
+       JOIN users u ON u.id=se.user_id
+       JOIN shift_defs sd ON sd.id=se.shift_def_id
+       JOIN nozzles n ON n.id=se.nozzle_id
+       JOIN pumps p ON p.id=n.pump_id
+       WHERE se.status='Open' ${where}
+       ORDER BY ${pumpOrderSql("p")}, se.product`,
+      params
+    )
+  );
 }
 
 function dashboardMetrics() {
@@ -857,12 +888,6 @@ function masterForm(kind, rows) {
       <label class="field"><span>Status</span><select name="status">${option("Active")}${option("Inactive")}</select></label>`;
   } else if (kind === "pumps") {
     fields = `<label class="field"><span>Pump name / number</span><input name="name" required></label><label class="field"><span>Status</span><select name="status">${option("Active")}${option("Inactive")}</select></label>`;
-  } else if (kind === "nozzles") {
-    fields = `<label class="field"><span>Pump</span><select name="pump_id">${pumps.map((p) => option(p.id, p.name)).join("")}</select></label>
-      <label class="field"><span>Nozzle name / number</span><input name="name" required></label>
-      <label class="field"><span>Product</span><select name="product">${PRODUCTS.map((p) => option(p, p)).join("")}</select></label>
-      <label class="field"><span>Linked tank</span><select name="tank_id">${tanks.map((t) => option(t.id, `${t.name} - ${t.product}`)).join("")}</select></label>
-      <label class="field"><span>Status</span><select name="status">${option("Active")}${option("Inactive")}</select></label>`;
   } else if (kind === "team") {
     fields = `<label class="field"><span>Employee name</span><input name="name" required></label>
       <label class="field"><span>Username / login ID</span><input name="mobile" required></label>
@@ -895,7 +920,6 @@ app.get("/master/:kind", requireLogin, requireRoles("admin", "manager"), (req, r
   const queries = {
     tanks: "SELECT * FROM tanks ORDER BY product, name",
     pumps: "SELECT * FROM pumps ORDER BY name",
-    nozzles: "SELECT n.*, p.name pump, t.name tank FROM nozzles n JOIN pumps p ON p.id=n.pump_id JOIN tanks t ON t.id=n.tank_id ORDER BY p.name, n.name",
     team: "SELECT id, name, mobile, role, status, assigned_pumps FROM users ORDER BY role, name",
     shifts: "SELECT * FROM shift_defs ORDER BY start_time",
     customers: "SELECT * FROM customers ORDER BY name",
@@ -912,7 +936,6 @@ app.post("/master/:kind", requireLogin, requireRoles("admin", "manager"), (req, 
   if (kind === "nozzles") return res.redirect("/master/pumps");
   if (kind === "tanks") run("INSERT INTO tanks(name, product, capacity, opening_dip, current_stock, status) VALUES(?,?,?,?,?,?)", [b.name, b.product, Number(b.capacity), Number(b.opening_dip || 0), Number(b.current_stock || 0), b.status || "Active"]);
   else if (kind === "pumps") run("INSERT INTO pumps(name, status) VALUES(?,?)", [b.name, b.status || "Active"]);
-  else if (kind === "nozzles") run("INSERT INTO nozzles(pump_id, name, product, tank_id, status) VALUES(?,?,?,?,?)", [Number(b.pump_id), b.name, b.product, Number(b.tank_id), b.status || "Active"]);
   else if (kind === "team") run("INSERT INTO users(name, mobile, role, password_hash, status, assigned_pumps) VALUES(?,?,?,?,?,?)", [b.name, b.mobile, b.role, hashWerkzeug(b.password), b.status || "Active", b.assigned_pumps || ""]);
   else if (kind === "shifts") run("INSERT INTO shift_defs(name, start_time, end_time, description, status) VALUES(?,?,?,?,?)", [b.name, b.start_time, b.end_time, b.description || "", b.status || "Active"]);
   else if (kind === "customers") run("INSERT INTO customers(name, mobile, vehicle_number, company_name, address, credit_limit, balance, status) VALUES(?,?,?,?,?,?,?,?)", [b.name, b.mobile || "", b.vehicle_number || "", b.company_name || "", b.address || "", Number(b.credit_limit || 0), Number(b.opening_balance || 0), b.status || "Active"]);
@@ -972,8 +995,8 @@ app.post("/master/team/:id/edit", requireLogin, requireRoles("admin", "manager")
 });
 
 function dayOpeningRows(dayId) {
-  return all(
-    `SELECT d.business_date, p.name pump, n.product, dnr.opening_meter
+  const rows = all(
+    `SELECT d.business_date, p.id pump_id, p.name pump, n.product, dnr.opening_meter
      FROM day_nozzle_readings dnr
      JOIN days d ON d.id=dnr.day_id
      JOIN nozzles n ON n.id=dnr.nozzle_id
@@ -982,6 +1005,14 @@ function dayOpeningRows(dayId) {
      ORDER BY p.name, n.product, n.name`,
     [dayId]
   );
+  const grouped = new Map();
+  for (const row of rows) {
+    if (!grouped.has(row.pump_id)) grouped.set(row.pump_id, { business_date: row.business_date, pump: row.pump, ms_opening: "", hsd_opening: "" });
+    const item = grouped.get(row.pump_id);
+    if (row.product === "MS") item.ms_opening = row.opening_meter;
+    if (row.product === "HSD") item.hsd_opening = row.opening_meter;
+  }
+  return Array.from(grouped.values());
 }
 
 function renderDayStart(req, res, values = {}, error = "") {
@@ -1010,10 +1041,16 @@ function renderDayStart(req, res, values = {}, error = "") {
       <label class="field"><span>MS price</span><input name="ms_price" type="number" step="0.01" value="${esc(fieldValue(values, "ms_price", ""))}" required></label>
       <label class="field"><span>HSD price</span><input name="hsd_price" type="number" step="0.01" value="${esc(fieldValue(values, "hsd_price", ""))}" required></label>
       <div class="form-section"><strong>Pump opening meter readings</strong><small>Saved by pump and product for shift start</small></div>
-      ${nozzles.map((n) => {
-        const name = `meter_${n.id}_opening`;
-        const suggested = lastMeter(n.id) ?? 0;
-        return `<label class="field"><span>${esc(n.pump)} ${esc(n.product)}</span><input name="${name}" type="number" step="0.001" value="${esc(fieldValue(values, name, suggested))}" required></label>`;
+      ${pumps.map((p) => {
+        const pumpMeters = nozzles
+          .filter((n) => Number(n.pump_id) === Number(p.id))
+          .map((n) => {
+            const name = `meter_${n.id}_opening`;
+            const suggested = lastMeter(n.id) ?? 0;
+            return `<label class="field"><span>${esc(n.product)}</span><input name="${name}" type="number" step="0.001" value="${esc(fieldValue(values, name, suggested))}" required></label>`;
+          })
+          .join("");
+        return `<div class="form-section"><strong>${esc(p.name)}</strong><small>Opening meter readings</small></div>${pumpMeters}`;
       }).join("") || '<div class="form-error span-2">Add active pumps before starting the day.</div>'}
       <div class="form-section"><strong>Pump testing values</strong><small>Enter testing quantity for each configured pump.</small></div>
       ${pumps.map((p) => `
@@ -1118,16 +1155,7 @@ function renderShiftStart(req, res, values = {}, error = "") {
      ORDER BY n.product, n.name`,
     [selectedPumpId]
   );
-  const openEntries = all(
-    `SELECT p.name pump, se.product, u.name user_name, se.opening_meter, se.status
-     FROM shift_entries se
-     JOIN users u ON u.id=se.user_id
-     JOIN nozzles n ON n.id=se.nozzle_id
-     JOIN pumps p ON p.id=n.pump_id
-     WHERE se.day_id=? AND se.status='Open'
-     ORDER BY CASE WHEN p.name GLOB 'Pump [0-9]*' THEN CAST(SUBSTR(p.name, 6) AS INTEGER) ELSE 999999 END, p.name, se.product`,
-    [day.id]
-  );
+  const openEntries = activePumpGroups(req).filter((r) => r.business_date === day.business_date);
   res.send(layout(req, "Start Shift", `${pageHead("Start Shift", "Operations > Start Shift")}
     <section class="form-card"><form method="post" class="grid-form">
       ${inlineError(error)}
@@ -1136,10 +1164,11 @@ function renderShiftStart(req, res, values = {}, error = "") {
       <label class="field"><span>Time in</span><input name="time_in" type="time" value="${esc(fieldValue(values, "time_in", new Date().toTimeString().slice(0, 5)))}"></label>
       <label class="field"><span>Detected shift</span><select name="shift_def_id"><option value="">Auto by time</option>${shifts.map((s) => option(s.id, `${s.name} (${s.start_time}-${s.end_time})`, fieldValue(values, "shift_def_id", ""))).join("")}</select></label>
       <div class="form-section"><strong>Opening meters</strong><small>Defaults come from the day-start pump readings</small></div>
+      <div class="form-section"><strong>${esc(pumps.find((p) => Number(p.id) === selectedPumpId)?.name || "Pump")}</strong><small>MS and HSD readings</small></div>
       ${nozzles.map((n) => {
         const name = `opening_meter_${n.id}`;
         const suggested = dayOpeningMeter(day.id, n.id) ?? lastMeter(n.id) ?? 0;
-        return `<label class="field"><span>${esc(n.pump)} ${esc(n.product)}</span><input name="${name}" type="number" step="0.001" value="${esc(fieldValue(values, name, suggested))}"></label>`;
+        return `<label class="field"><span>${esc(n.product)}</span><input name="${name}" type="number" step="0.001" value="${esc(fieldValue(values, name, suggested))}"></label>`;
       }).join("") || '<div class="form-error span-2">Selected pump is not configured for MS/HSD.</div>'}
       <div class="action-row"><button class="primary" ${pumps.length && users.length && shifts.length && nozzles.length && hasAvailablePump && hasAvailableUser ? "" : "disabled"}>Start Shift</button></div>
     </form></section>
@@ -1213,15 +1242,7 @@ app.route("/shift/start")
   });
 
 app.get("/shifts/active", requireLogin, (req, res) => {
-  const where = req.user.role === "pump_boy" ? "AND se.user_id=?" : "";
-  const params = req.user.role === "pump_boy" ? [req.user.id] : [];
-  let entries = all(
-    `SELECT se.id, se.business_date, p.id pump_id, p.name pump, se.product, u.name user_name, sd.name shift_name, se.opening_meter, se.status
-     FROM shift_entries se JOIN users u ON u.id=se.user_id JOIN shift_defs sd ON sd.id=se.shift_def_id
-     JOIN nozzles n ON n.id=se.nozzle_id JOIN pumps p ON p.id=n.pump_id
-     WHERE se.status='Open' ${where} ORDER BY se.opened_at DESC`,
-    params
-  );
+  let entries = activePumpGroups(req);
   entries = entries.map((r) => ({ ...r, actions: `<a class="link-button secondary" href="/shift/pump/${esc(r.pump_id)}/edit">Edit</a>` }));
   res.send(layout(req, "Active Shifts", `${pageHead("Active Shifts", "Operations > Active Shifts", '<a class="primary link-button" href="/shift/close">Close Shift</a>')}${table(entries)}`));
 });
@@ -1287,23 +1308,20 @@ app.post("/shift/pump/:pumpId/edit", requireLogin, (req, res) => {
 });
 
 function renderShiftClose(req, res, values = {}, error = "") {
-  const where = req.user.role === "pump_boy" ? "AND se.user_id=?" : "";
-  const params = req.user.role === "pump_boy" ? [req.user.id] : [];
-  const openEntries = all(
-    `SELECT se.*, u.name user_name, p.name pump
-     FROM shift_entries se JOIN users u ON u.id=se.user_id JOIN nozzles n ON n.id=se.nozzle_id JOIN pumps p ON p.id=n.pump_id
-     WHERE se.status='Open' ${where} ORDER BY se.opened_at DESC`,
-    params
-  );
+  const openPumps = activePumpGroups(req);
   const customers = all("SELECT * FROM customers WHERE status='Active' ORDER BY name");
-  const selectedId = fieldValue(values, "shift_entry_id", req.query.id || "");
+  const selectedPumpId = Number(fieldValue(values, "pump_id", req.query.pump_id || openPumps[0]?.pump_id || ""));
+  const selectedPump = openPumps.find((p) => Number(p.pump_id) === selectedPumpId);
   res.send(layout(req, "Close Shift", `${pageHead("Close Shift", "Operations > Close Shift")}
     <section class="form-card"><form method="post" class="grid-form">
       ${inlineError(error)}
-      <label class="field span-2"><span>Open shift</span><select name="shift_entry_id">${openEntries.map((e) => option(e.id, `${e.business_date} - ${e.pump} - ${e.user_name} - ${e.product}`, selectedId)).join("")}</select></label>
-      <label class="field"><span>Closing meter</span><input name="closing_meter" type="number" step="0.001" value="${esc(fieldValue(values, "closing_meter", ""))}" required></label>
-      <label class="field"><span>Testing done</span><select name="testing_done">${option("", "No", fieldValue(values, "testing_done", ""))}${option("1", "Yes", fieldValue(values, "testing_done", ""))}</select></label>
-      <label class="field"><span>Testing qty</span><input name="testing_qty" type="number" step="0.001" value="${esc(fieldValue(values, "testing_qty", 0))}"></label>
+      <label class="field span-2"><span>Active pump</span><select name="pump_id" onchange="window.location='/shift/close?pump_id='+this.value">${openPumps.map((p) => option(p.pump_id, `${p.business_date} - ${p.pump} - ${p.user_name}`, selectedPumpId)).join("")}</select></label>
+      <div class="form-section"><strong>${esc(selectedPump?.pump || "Pump")} closing meters</strong><small>Close MS and HSD together for this pump.</small></div>
+      <label class="field"><span>MS closing meter</span><input name="closing_MS" type="number" step="0.001" value="${esc(fieldValue(values, "closing_MS", selectedPump?.ms_closing || ""))}" required></label>
+      <label class="field"><span>HSD closing meter</span><input name="closing_HSD" type="number" step="0.001" value="${esc(fieldValue(values, "closing_HSD", selectedPump?.hsd_closing || ""))}" required></label>
+      <label class="field"><span>MS testing qty</span><input name="testing_MS" type="number" step="0.001" value="${esc(fieldValue(values, "testing_MS", 0))}"></label>
+      <label class="field"><span>HSD testing qty</span><input name="testing_HSD" type="number" step="0.001" value="${esc(fieldValue(values, "testing_HSD", 0))}"></label>
+      <div class="form-section"><strong>Collections</strong><small>Enter total collections for this pump.</small></div>
       <label class="field"><span>Cash</span><input name="cash" type="number" step="0.01" value="${esc(fieldValue(values, "cash", 0))}"></label>
       <label class="field"><span>UPI</span><input name="upi" type="number" step="0.01" value="${esc(fieldValue(values, "upi", 0))}"></label>
       <label class="field"><span>Card</span><input name="card" type="number" step="0.01" value="${esc(fieldValue(values, "card", 0))}"></label>
@@ -1314,8 +1332,8 @@ function renderShiftClose(req, res, values = {}, error = "") {
       <label class="field"><span>Beta</span><input name="beta" type="number" step="0.01" value="${esc(fieldValue(values, "beta", 0))}"></label>
       <label class="field"><span>Miscellaneous</span><input name="miscellaneous" type="number" step="0.01" value="${esc(fieldValue(values, "miscellaneous", 0))}"></label>
       <label class="field span-2"><span>Remarks</span><textarea name="remarks">${esc(fieldValue(values, "remarks", ""))}</textarea></label>
-      <div class="action-row"><button class="primary" ${openEntries.length ? "" : "disabled"}>Close Shift</button></div>
-    </form></section>${table(openEntries)}`));
+      <div class="action-row"><button class="primary" ${openPumps.length ? "" : "disabled"}>Close Pump</button></div>
+    </form></section><section class="table-card">${table(openPumps)}</section>`));
 }
 
 app.route("/shift/close")
@@ -1323,47 +1341,100 @@ app.route("/shift/close")
     renderShiftClose(req, res);
   })
   .post(requireLogin, (req, res) => {
-    const se = one("SELECT * FROM shift_entries WHERE id=? AND status='Open'", [Number(req.body.shift_entry_id)]);
-    if (!se) {
-      return renderShiftClose(req, res, req.body, "Open shift not found.");
+    const pumpId = Number(req.body.pump_id);
+    const where = req.user.role === "pump_boy" ? "AND se.user_id=?" : "";
+    const params = req.user.role === "pump_boy" ? [pumpId, req.user.id] : [pumpId];
+    const entries = all(
+      `SELECT se.*, p.name pump, u.name user_name
+       FROM shift_entries se
+       JOIN users u ON u.id=se.user_id
+       JOIN nozzles n ON n.id=se.nozzle_id
+       JOIN pumps p ON p.id=n.pump_id
+       WHERE p.id=? AND se.status='Open' ${where}
+       ORDER BY se.product`,
+      params
+    );
+    if (!entries.length) return renderShiftClose(req, res, req.body, "Active pump not found.");
+    const calculated = [];
+    for (const entry of entries) {
+      const closing = Number(req.body[`closing_${entry.product}`]);
+      if (Number.isNaN(closing)) return renderShiftClose(req, res, req.body, `Enter ${entry.product} closing meter.`);
+      if (closing < Number(entry.opening_meter)) return renderShiftClose(req, res, req.body, `${entry.product} closing cannot be less than opening.`);
+      const testingQty = litres(req.body[`testing_${entry.product}`] || 0);
+      const sold = Math.max(0, litres(closing - Number(entry.opening_meter) - testingQty));
+      const amount = money(sold * Number(entry.rate));
+      calculated.push({ entry, closing, testingQty, sold, amount });
     }
-    if (req.user.role === "pump_boy" && se.user_id !== req.user.id) return res.status(403).send("Forbidden");
-    const closing = Number(req.body.closing_meter);
-    if (closing < Number(se.opening_meter)) {
-      return renderShiftClose(req, res, req.body, "Closing reading cannot be less than opening reading.");
-    }
-    const pmts = getShiftPaymentsTotal(se.id);
-    const testingQty = req.body.testing_done ? litres(req.body.testing_qty) : 0;
-    const sold = Math.max(0, litres(closing - Number(se.opening_meter) - testingQty));
-    const amount = money(sold * Number(se.rate));
-    const cash = money(Number(pmts.cash) + money(req.body.cash));
-    const upi = money(Number(pmts.upi) + money(req.body.upi));
-    const card = money(Number(pmts.card) + money(req.body.card));
-    const credit = money(Number(pmts.credit) + money(req.body.credit));
+    const currentPayments = calculated.reduce(
+      (totals, item) => {
+        const p = getShiftPaymentsTotal(item.entry.id);
+        totals.cash += Number(p.cash || 0);
+        totals.upi += Number(p.upi || 0);
+        totals.card += Number(p.card || 0);
+        totals.credit += Number(p.credit || 0);
+        return totals;
+      },
+      { cash: 0, upi: 0, card: 0, credit: 0 }
+    );
+    const totalAmount = money(calculated.reduce((a, item) => a + item.amount, 0));
+    const cash = money(currentPayments.cash + money(req.body.cash));
+    const upi = money(currentPayments.upi + money(req.body.upi));
+    const card = money(currentPayments.card + money(req.body.card));
+    const credit = money(currentPayments.credit + money(req.body.credit));
     const expenses = money(req.body.expenses);
     const beta = money(req.body.beta);
     const misc = money(req.body.miscellaneous);
-    const shortage = money(cash + upi + card + credit + expenses + beta + misc - amount);
+    const shortage = money(cash + upi + card + credit + expenses + beta + misc - totalAmount);
     const customerId = req.body.customer_id || null;
-    if (credit > 0 && !customerId && Number(pmts.credit) === 0) {
+    if (credit > 0 && !customerId && Number(currentPayments.credit) === 0) {
       return renderShiftClose(req, res, req.body, "Select a credit customer for credit sale.");
     }
-    run(
-      `UPDATE shift_entries SET closing_meter=?, litres_sold=?, sales_amount=?, cash=?, upi=?, card=?, credit=?,
-       customer_id=?, expenses=?, beta=?, miscellaneous=?, remarks=?, shortage_excess=?, testing_qty=?, status='Closed',
-       closed_at=CURRENT_TIMESTAMP WHERE id=?`,
-      [closing, sold, amount, cash, upi, card, credit, customerId, expenses, beta, misc, req.body.remarks || "", shortage, testingQty, se.id]
-    );
-    run("UPDATE tanks SET current_stock=current_stock-? WHERE id=?", [sold, se.tank_id]);
-    if (expenses) run("INSERT INTO expenses(business_date, shift_entry_id, paid_by, category, amount, note, payment_mode) VALUES(?,?,?,?,?,?,?)", [se.business_date, se.id, se.user_id, req.body.expense_category || "Miscellaneous", expenses, req.body.expense_note || "", "Cash"]);
-    if (customerId && credit > 0 && Number(pmts.credit) === 0) {
-      run("UPDATE customers SET balance=balance+? WHERE id=?", [credit, customerId]);
-      const nozzle = one("SELECT p.name pump FROM nozzles n JOIN pumps p ON p.id=n.pump_id WHERE n.id=?", [se.nozzle_id]);
-      const member = one("SELECT name FROM users WHERE id=?", [se.user_id]);
-      run("INSERT INTO credit_ledger(customer_id, business_date, entry_type, product, litres, amount, pump_nozzle, team_member, shift_entry_id, notes) VALUES(?,?,?,?,?,?,?,?,?,?)", [customerId, se.business_date, "credit", se.product, sold, credit, nozzle.pump, member.name, se.id, req.body.remarks || ""]);
+    const share = (value, amount) => (totalAmount > 0 ? money(value * (amount / totalAmount)) : 0);
+    for (let i = 0; i < calculated.length; i += 1) {
+      const item = calculated[i];
+      const isLast = i === calculated.length - 1;
+      const allocatedCash = isLast ? money(cash - calculated.slice(0, i).reduce((a, x) => a + share(cash, x.amount), 0)) : share(cash, item.amount);
+      const allocatedUpi = isLast ? money(upi - calculated.slice(0, i).reduce((a, x) => a + share(upi, x.amount), 0)) : share(upi, item.amount);
+      const allocatedCard = isLast ? money(card - calculated.slice(0, i).reduce((a, x) => a + share(card, x.amount), 0)) : share(card, item.amount);
+      const allocatedCredit = isLast ? money(credit - calculated.slice(0, i).reduce((a, x) => a + share(credit, x.amount), 0)) : share(credit, item.amount);
+      const allocatedExpenses = isLast ? money(expenses - calculated.slice(0, i).reduce((a, x) => a + share(expenses, x.amount), 0)) : share(expenses, item.amount);
+      const allocatedBeta = isLast ? money(beta - calculated.slice(0, i).reduce((a, x) => a + share(beta, x.amount), 0)) : share(beta, item.amount);
+      const allocatedMisc = isLast ? money(misc - calculated.slice(0, i).reduce((a, x) => a + share(misc, x.amount), 0)) : share(misc, item.amount);
+      const allocatedShortage = isLast ? money(shortage - calculated.slice(0, i).reduce((a, x) => a + share(shortage, x.amount), 0)) : share(shortage, item.amount);
+      run(
+        `UPDATE shift_entries SET closing_meter=?, litres_sold=?, sales_amount=?, cash=?, upi=?, card=?, credit=?,
+         customer_id=?, expenses=?, beta=?, miscellaneous=?, remarks=?, shortage_excess=?, testing_qty=?, status='Closed',
+         closed_at=CURRENT_TIMESTAMP WHERE id=?`,
+        [
+          item.closing,
+          item.sold,
+          item.amount,
+          allocatedCash,
+          allocatedUpi,
+          allocatedCard,
+          allocatedCredit,
+          customerId,
+          allocatedExpenses,
+          allocatedBeta,
+          allocatedMisc,
+          req.body.remarks || "",
+          allocatedShortage,
+          item.testingQty,
+          item.entry.id,
+        ]
+      );
+      run("UPDATE tanks SET current_stock=current_stock-? WHERE id=?", [item.sold, item.entry.tank_id]);
     }
-    flash(req, Math.abs(shortage) <= 0.01 ? "success" : "warning", `Shift closed. ${se.product}: ${sold.toFixed(3)}L | Sales ${rs(amount)} | Shortage/Excess ${rs(shortage)}`);
-    res.redirect(`/shift/summary/${se.id}`);
+    if (expenses) run("INSERT INTO expenses(business_date, shift_entry_id, paid_by, category, amount, note, payment_mode) VALUES(?,?,?,?,?,?,?)", [entries[0].business_date, entries[0].id, entries[0].user_id, req.body.expense_category || "Miscellaneous", expenses, req.body.expense_note || "", "Cash"]);
+    if (customerId && credit > 0 && Number(currentPayments.credit) === 0) {
+      run("UPDATE customers SET balance=balance+? WHERE id=?", [credit, customerId]);
+      for (const item of calculated) {
+        const allocatedCredit = share(credit, item.amount);
+        if (allocatedCredit > 0) run("INSERT INTO credit_ledger(customer_id, business_date, entry_type, product, litres, amount, pump_nozzle, team_member, shift_entry_id, notes) VALUES(?,?,?,?,?,?,?,?,?,?)", [customerId, item.entry.business_date, "credit", item.entry.product, item.sold, allocatedCredit, item.entry.pump, item.entry.user_name, item.entry.id, req.body.remarks || ""]);
+      }
+    }
+    flash(req, Math.abs(shortage) <= 0.01 ? "success" : "warning", `Pump closed. Sales ${rs(totalAmount)} | Shortage/Excess ${rs(shortage)}`);
+    res.redirect(`/reports?start=${encodeURIComponent(entries[0].business_date)}&end=${encodeURIComponent(entries[0].business_date)}`);
   });
 
 app.get("/shift/summary/:id", requireLogin, (req, res) => {
@@ -1491,14 +1562,48 @@ app.get("/reports", requireLogin, (req, res) => {
     extra += " AND se.user_id=?";
     params.push(userId);
   }
-  const shifts = all(
-    `SELECT se.*, u.name user_name, sd.name shift_name, p.name pump
+  const shiftRows = all(
+    `SELECT se.business_date, p.id pump_id, p.name pump, u.name user_name, sd.name shift_name, se.product,
+     se.litres_sold, se.sales_amount, se.cash, se.upi, se.card, se.credit, se.expenses, se.beta, se.shortage_excess, se.status
      FROM shift_entries se JOIN users u ON u.id=se.user_id JOIN shift_defs sd ON sd.id=se.shift_def_id
      JOIN nozzles n ON n.id=se.nozzle_id JOIN pumps p ON p.id=n.pump_id
      WHERE se.business_date BETWEEN ? AND ? ${extra}
-     ORDER BY se.business_date DESC, se.id DESC`,
+     ORDER BY se.business_date DESC, ${pumpOrderSql("p")}, se.product`,
     params
   );
+  const reportMap = new Map();
+  for (const row of shiftRows) {
+    const key = `${row.business_date}-${row.pump_id}-${row.user_name}-${row.shift_name}-${row.status}`;
+    if (!reportMap.has(key)) {
+      reportMap.set(key, {
+        business_date: row.business_date,
+        pump: row.pump,
+        team_member: row.user_name,
+        shift: row.shift_name,
+        ms_litres: 0,
+        hsd_litres: 0,
+        total_litres: 0,
+        sales: 0,
+        cash: 0,
+        upi: 0,
+        card: 0,
+        credit: 0,
+        shortage_excess: 0,
+        status: row.status,
+      });
+    }
+    const item = reportMap.get(key);
+    if (row.product === "MS") item.ms_litres = litres(Number(item.ms_litres) + Number(row.litres_sold || 0));
+    if (row.product === "HSD") item.hsd_litres = litres(Number(item.hsd_litres) + Number(row.litres_sold || 0));
+    item.total_litres = litres(Number(item.total_litres) + Number(row.litres_sold || 0));
+    item.sales = money(Number(item.sales) + Number(row.sales_amount || 0));
+    item.cash = money(Number(item.cash) + Number(row.cash || 0));
+    item.upi = money(Number(item.upi) + Number(row.upi || 0));
+    item.card = money(Number(item.card) + Number(row.card || 0));
+    item.credit = money(Number(item.credit) + Number(row.credit || 0));
+    item.shortage_excess = money(Number(item.shortage_excess) + Number(row.shortage_excess || 0));
+  }
+  const shifts = Array.from(reportMap.values());
   const summary = one(
     `SELECT COALESCE(SUM(litres_sold),0) litres, COALESCE(SUM(sales_amount),0) sales,
      COALESCE(SUM(cash),0) cash, COALESCE(SUM(upi),0) upi, COALESCE(SUM(card),0) card,
