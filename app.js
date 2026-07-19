@@ -998,6 +998,20 @@ async function dashboardMetrics() {
     )).c,
     credit_pending: (await one("SELECT COALESCE(SUM(balance),0) b FROM customers WHERE status='Active'")).b,
     top_customers: await all("SELECT name, balance FROM customers WHERE balance>0 ORDER BY balance DESC LIMIT 5"),
+    pump_sales: await all(
+      `SELECT p.name pump, u.name salesperson, u.mobile login_id,
+       COALESCE(SUM(CASE WHEN se.product='MS' THEN se.litres_sold ELSE 0 END),0) ms_litres,
+       COALESCE(SUM(CASE WHEN se.product='HSD' THEN se.litres_sold ELSE 0 END),0) hsd_litres,
+       COALESCE(SUM(se.sales_amount),0) sales
+       FROM shift_entries se
+       JOIN users u ON u.id=se.user_id
+       JOIN nozzles n ON n.id=se.nozzle_id
+       JOIN pumps p ON p.id=n.pump_id
+       WHERE se.day_id=? AND se.status='Closed'
+       GROUP BY p.id, p.name, u.id, u.name, u.mobile
+       ORDER BY ${pumpOrderSql("p")}, sales DESC, u.name`,
+      [day.id]
+    ),
     boy_sales: await all(
       `SELECT u.name person, u.mobile login_id, p.name pump,
        COALESCE(SUM(CASE WHEN se.product='MS' THEN se.litres_sold ELSE 0 END),0) ms_litres,
@@ -1321,8 +1335,8 @@ app.get("/", requireLogin, async (req, res) => {
         req,
         "Dashboard",
         `${pageHead(`Welcome Back, ${req.user.name}`, "Home > Dashboard")}
-        <section class="empty-state"><h2>No open business day</h2><p>Start a new business day when ready.</p><a class="primary link-button" href="/day/start">Start Day</a></section>
-        ${closedDayReport || '<section class="table-card"><div class="table-card-head"><div><h2>Day Report</h2><p>No closed day report is available yet.</p></div></div><div class="empty-state"><h2>No closed day</h2><p>Close a business day to see the owner account report here.</p></div></section>'}`
+        ${closedDayReport || '<section class="table-card"><div class="table-card-head"><div><h2>Day Report</h2><p>No closed day report is available yet.</p></div></div><div class="empty-state"><h2>No closed day</h2><p>Close a business day to see the owner account report here.</p></div></section>'}
+        <section class="empty-state"><h2>No open business day</h2><p>Start a new business day when ready.</p><a class="primary link-button" href="/day/start">Start Day</a></section>`
       )
     );
   }
@@ -1343,6 +1357,7 @@ app.get("/", requireLogin, async (req, res) => {
       req,
       "Dashboard",
       `${pageHead(`Welcome Back, ${req.user.name}`, "Home > Dashboard", '<div style="display:flex;gap:8px;"><a class="primary link-button" href="/shift/start">Start Shift</a><a class="link-button" href="/shifts/active">Active Shifts</a></div>')}
+      <section class="table-card"><div class="table-card-head"><div><h2>Day Opening and Closing Readings</h2><p>Pump readings for ${esc(m.day.business_date)}.</p></div><span class="badge">${esc(m.day.business_date)}</span></div>${tableColumns(openingRows, ["business_date", "pump", "ms_opening", "ms_closing", "hsd_opening", "hsd_closing"])}</section>
       <section class="stat-grid">
         <div class="stat hero"><span>Today sales</span><strong>${rs(m.totals.sales)}</strong><small>${esc(m.day.business_date)}</small></div>
         <div class="stat"><span>Cash</span><strong>${rs(m.totals.cash)}</strong><small>Opening ${rs(m.day.opening_cash)}</small></div>
@@ -1360,7 +1375,7 @@ app.get("/", requireLogin, async (req, res) => {
         </div>
         <div class="panel"><div class="panel-title"><h2>Payment Split</h2></div>${m.payment_totals.map((r) => `<div class="ledger-line"><span>${esc(r.payment_type || "Unsorted")}</span><strong>${rs(r.amount)}</strong></div>`).join("") || '<p class="muted">No shift payments logged yet.</p>'}</div>
         <div class="panel"><div class="panel-title"><h2>Top Credit Customers</h2></div>${m.top_customers.map((c) => `<div class="ledger-line"><span>${esc(c.name)}</span><strong>${rs(c.balance)}</strong></div>`).join("") || '<p class="muted">No pending customer credit.</p>'}</div>
-        <div class="panel wide"><div class="panel-title"><h2>Day Opening Readings</h2><span class="badge">${esc(m.day.business_date)}</span></div>${table(openingRows)}</div>
+        <div class="panel wide"><div class="panel-title"><h2>Pump-wise Sales</h2></div>${tableColumns(m.pump_sales, ["pump", "salesperson", "login_id", "ms_litres", "hsd_litres", "sales"])}</div>
         ${renderDayReport(m.latestClosedDay, m.latestDayReport)}
         <div class="panel wide"><div class="panel-title"><h2>Open Shift Records</h2><span class="badge">${esc(m.open_shifts)} open</span></div>${tableColumns(openEntries, ["business_date", "pump", "user_name", "ms_opening", "hsd_opening", "status"])}</div>
         <div class="panel wide"><div class="panel-title"><h2>Salesperson-wise Sales</h2></div>${tableColumns(m.boy_sales, ["person", "login_id", "pump", "ms_litres", "hsd_litres", "sales"])}</div>
@@ -1526,7 +1541,7 @@ app.post("/master/team/:id/edit", requireLogin, requireRoles("admin", "manager")
 
 async function dayOpeningRows(dayId) {
   const rows = await all(
-    `SELECT d.business_date, p.id pump_id, p.name pump, n.product, dnr.opening_meter
+    `SELECT d.business_date, p.id pump_id, p.name pump, n.product, dnr.opening_meter, dnr.closing_meter
      FROM day_nozzle_readings dnr
      JOIN days d ON d.id=dnr.day_id
      JOIN nozzles n ON n.id=dnr.nozzle_id
@@ -1537,10 +1552,16 @@ async function dayOpeningRows(dayId) {
   );
   const grouped = new Map();
   for (const row of rows) {
-    if (!grouped.has(row.pump_id)) grouped.set(row.pump_id, { business_date: row.business_date, pump: row.pump, ms_opening: "", hsd_opening: "" });
+    if (!grouped.has(row.pump_id)) grouped.set(row.pump_id, { business_date: row.business_date, pump: row.pump, ms_opening: "", ms_closing: "", hsd_opening: "", hsd_closing: "" });
     const item = grouped.get(row.pump_id);
-    if (row.product === "MS") item.ms_opening = row.opening_meter;
-    if (row.product === "HSD") item.hsd_opening = row.opening_meter;
+    if (row.product === "MS") {
+      item.ms_opening = row.opening_meter;
+      item.ms_closing = row.closing_meter ?? "";
+    }
+    if (row.product === "HSD") {
+      item.hsd_opening = row.opening_meter;
+      item.hsd_closing = row.closing_meter ?? "";
+    }
   }
   return Array.from(grouped.values());
 }
