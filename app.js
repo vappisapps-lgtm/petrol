@@ -611,8 +611,11 @@ function istParts(date = new Date()) {
     hour: "2-digit",
     minute: "2-digit",
     hour12: false,
+    hourCycle: "h23",
   }).formatToParts(date);
-  return Object.fromEntries(parts.map((part) => [part.type, part.value]));
+  const values = Object.fromEntries(parts.map((part) => [part.type, part.value]));
+  if (values.hour === "24") values.hour = "00";
+  return values;
 }
 
 function todayIso() {
