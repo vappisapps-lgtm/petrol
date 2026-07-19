@@ -22,6 +22,7 @@ const MYSQL_CONFIG = {
   database: process.env.DB_NAME,
   user: process.env.DB_USER,
   password: process.env.DB_PASSWORD,
+  dateStrings: true,
   waitForConnections: true,
   connectionLimit: Number(process.env.DB_POOL_LIMIT || 5),
 };
@@ -702,20 +703,33 @@ function timestampForBusinessTime(businessDate, timeValue) {
   return `${date} ${time}:00`;
 }
 
+function normalizeTimestamp(value) {
+  if (!value) return "";
+  if (value instanceof Date) {
+    const pad = (number) => String(number).padStart(2, "0");
+    return `${value.getFullYear()}-${pad(value.getMonth() + 1)}-${pad(value.getDate())} ${pad(value.getHours())}:${pad(value.getMinutes())}:${pad(value.getSeconds())}`;
+  }
+  const text = String(value).replace("T", " ");
+  return text.length >= 19 ? text.slice(0, 19) : text;
+}
+
 function closingTimestampForBusinessTime(businessDate, timeValue, openedAt) {
   let timestamp = timestampForBusinessTime(businessDate, timeValue);
-  if (openedAt && timestamp <= String(openedAt)) {
+  const opened = normalizeTimestamp(openedAt);
+  if (opened && timestamp <= opened) {
     timestamp = `${addDaysIso(timestamp.slice(0, 10), 1)} ${timestamp.slice(11)}`;
   }
   return timestamp;
 }
 
 function clockFromTimestamp(value) {
-  return value ? String(value).slice(11, 16) : "";
+  const timestamp = normalizeTimestamp(value);
+  return timestamp ? timestamp.slice(11, 16) : "";
 }
 
 function dateFromTimestamp(value) {
-  return value ? String(value).slice(0, 10) : "";
+  const timestamp = normalizeTimestamp(value);
+  return timestamp ? timestamp.slice(0, 10) : "";
 }
 
 function shiftWindowForDate(dateIso, shift) {
@@ -728,8 +742,8 @@ function shiftWindowForDate(dateIso, shift) {
 
 function matchedShiftName(openedAt, closedAt, shiftDefs, fallback = "") {
   if (!openedAt || !closedAt) return fallback || "Live shift";
-  const open = String(openedAt);
-  const close = String(closedAt);
+  const open = normalizeTimestamp(openedAt);
+  const close = normalizeTimestamp(closedAt);
   const openDate = dateFromTimestamp(open);
   const dates = [addDaysIso(openDate, -1), openDate, addDaysIso(openDate, 1)];
   for (const date of dates) {
@@ -744,7 +758,7 @@ function matchedShiftName(openedAt, closedAt, shiftDefs, fallback = "") {
 function crossesBusinessBoundary(businessDate, openedAt, closedAt) {
   if (!openedAt || !closedAt) return false;
   const boundary = `${addDaysIso(businessDate, 1)} 06:00:00`;
-  return String(openedAt) < boundary && String(closedAt) > boundary;
+  return normalizeTimestamp(openedAt) < boundary && normalizeTimestamp(closedAt) > boundary;
 }
 
 async function getShiftPaymentsTotal(entryId) {
@@ -2328,7 +2342,10 @@ app.route("/shift/close")
       params
     );
     if (!entries.length) return await renderShiftClose(req, res, req.body, "Active pump not found.");
-    const openedAt = entries.reduce((earliest, entry) => !earliest || String(entry.opened_at) < earliest ? String(entry.opened_at) : earliest, "");
+    const openedAt = entries.reduce((earliest, entry) => {
+      const opened = normalizeTimestamp(entry.opened_at);
+      return !earliest || opened < earliest ? opened : earliest;
+    }, "");
     const closedAt = closingTimestampForBusinessTime(entries[0].business_date, req.body.time_out, openedAt);
     const calculated = [];
     for (const entry of entries) {
@@ -2591,7 +2608,9 @@ app.get("/reports", requireLogin, async (req, res) => {
   const reportMap = new Map();
   for (const row of shiftRows) {
     const shiftName = matchedShiftName(row.opened_at, row.closed_at, shiftDefs, row.shift_name);
-    const key = `${row.business_date}-${row.pump_id}-${row.user_name}-${shiftName}-${row.opened_at}-${row.closed_at}-${row.status}`;
+    const openedAt = normalizeTimestamp(row.opened_at);
+    const closedAt = normalizeTimestamp(row.closed_at);
+    const key = `${row.business_date}-${row.pump_id}-${row.user_name}-${shiftName}-${openedAt}-${closedAt}-${row.status}`;
     if (!reportMap.has(key)) {
       reportMap.set(key, {
         business_date: row.business_date,
@@ -2601,8 +2620,8 @@ app.get("/reports", requireLogin, async (req, res) => {
         shift: shiftName,
         time_in: clockFromTimestamp(row.opened_at),
         time_out: clockFromTimestamp(row.closed_at),
-        opened_at: row.opened_at,
-        closed_at: row.closed_at,
+        opened_at: openedAt,
+        closed_at: closedAt,
         ms_price: money(row.ms_price || 0),
         hsd_price: money(row.hsd_price || 0),
         ms_opening: "",
