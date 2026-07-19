@@ -1,0 +1,54 @@
+# Live Real-Use Notes
+
+## Database Safety Rule
+
+- Live must use Hostinger MySQL only.
+- Do not depend on SQLite for live data anymore.
+- Code pushes must not delete, replace, seed, or overwrite live MySQL data.
+- Any future database change must be additive by default:
+  - create missing tables with `CREATE TABLE IF NOT EXISTS`
+  - add missing columns with guarded/ignored `ALTER TABLE`
+  - never drop tables
+  - never truncate tables
+  - never reset the database
+  - never auto-create dummy/demo rows on live
+- Before pushing any schema change, confirm whether it changes existing live data.
+
+## Current Requested Workflow Changes
+
+1. Day start opening readings are yesterday/previous closing readings.
+   - When entering start readings, the system should treat them as the readings carried forward into the selected business date.
+   - The entered date/login context should clearly reflect the intended business date.
+
+2. Shift payment logging during active shift.
+   - Salesperson should be able to add multiple payments while the shift is active.
+   - Each payment should log:
+     - time
+     - amount
+     - payment type
+     - product dropdown: MS or HSD
+   - Closing shift should automatically total/tally these payments.
+
+3. Closing and tallying.
+   - Closing should compare calculated pump sales against logged payments.
+   - MS and HSD should remain grouped under the pump, not separate shift rows in the UI.
+
+4. Dashboard and reports should focus on:
+   - complete sales data by date/day
+   - pump-wise MS/HSD readings, litres, and sales
+   - salesman/person-wise date data
+   - payment totals by type
+   - debts/credit values
+
+5. Screenshots are field/layout references only.
+   - Ignore dummy values in screenshots.
+   - Use the screenshots to understand required fields and reporting shape.
+
+## Implementation Order
+
+1. Confirm live MySQL is the only active live database.
+2. Make any required schema changes safely/additively.
+3. Implement active shift payment entry.
+4. Update shift closing auto-tally.
+5. Update dashboard/report views.
+6. Test locally and then push live.

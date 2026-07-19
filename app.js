@@ -34,6 +34,7 @@ let dbInitialized = false;
 
 const PRODUCTS = ["MS", "HSD"];
 const DEFAULT_EXPENSE_CATEGORIES = ["Tea", "Cleaning", "Maintenance", "Staff advance", "Miscellaneous"];
+const PAYMENT_TYPES = ["Cash", "Phone Pay", "Card", "Credit", "Personal", "Others"];
 const USING_MYSQL = DB_DIALECT === "mysql";
 const MIGRATION_TABLES = [
   "station",
@@ -214,6 +215,9 @@ const MYSQL_SCHEMA = [
   `CREATE TABLE IF NOT EXISTS shift_payments (
     id INT AUTO_INCREMENT PRIMARY KEY,
     shift_entry_id INT NOT NULL,
+    product VARCHAR(20),
+    payment_type VARCHAR(50),
+    amount DECIMAL(14,2) DEFAULT 0,
     cash DECIMAL(14,2) DEFAULT 0,
     upi DECIMAL(14,2) DEFAULT 0,
     card DECIMAL(14,2) DEFAULT 0,
@@ -276,6 +280,9 @@ async function initMysqlDb() {
     "ALTER TABLE shift_entries ADD COLUMN testing_qty DECIMAL(14,3) DEFAULT 0",
     "ALTER TABLE days ADD COLUMN testing_ms_qty DECIMAL(14,3) DEFAULT 0",
     "ALTER TABLE days ADD COLUMN testing_hsd_qty DECIMAL(14,3) DEFAULT 0",
+    "ALTER TABLE shift_payments ADD COLUMN product VARCHAR(20)",
+    "ALTER TABLE shift_payments ADD COLUMN payment_type VARCHAR(50)",
+    "ALTER TABLE shift_payments ADD COLUMN amount DECIMAL(14,2) DEFAULT 0",
   ]) {
     try {
       await db.query(sql);
@@ -440,6 +447,9 @@ async function initDb() {
     CREATE TABLE IF NOT EXISTS shift_payments (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       shift_entry_id INTEGER NOT NULL REFERENCES shift_entries(id),
+      product TEXT,
+      payment_type TEXT,
+      amount REAL DEFAULT 0,
       cash REAL DEFAULT 0,
       upi REAL DEFAULT 0,
       card REAL DEFAULT 0,
@@ -495,6 +505,9 @@ async function initDb() {
     "ALTER TABLE shift_entries ADD COLUMN testing_qty REAL DEFAULT 0",
     "ALTER TABLE days ADD COLUMN testing_ms_qty REAL DEFAULT 0",
     "ALTER TABLE days ADD COLUMN testing_hsd_qty REAL DEFAULT 0",
+    "ALTER TABLE shift_payments ADD COLUMN product TEXT",
+    "ALTER TABLE shift_payments ADD COLUMN payment_type TEXT",
+    "ALTER TABLE shift_payments ADD COLUMN amount REAL DEFAULT 0",
   ]) {
     try {
       db.exec(sql);
@@ -674,11 +687,56 @@ async function detectShift(timeStr) {
 
 async function getShiftPaymentsTotal(entryId) {
   return await one(
-    `SELECT COALESCE(SUM(cash),0) cash, COALESCE(SUM(upi),0) upi,
-     COALESCE(SUM(card),0) card, COALESCE(SUM(credit),0) credit
+    `SELECT
+     COALESCE(SUM(CASE WHEN payment_type='Cash' THEN amount ELSE cash END),0) cash,
+     COALESCE(SUM(CASE WHEN payment_type='Phone Pay' THEN amount ELSE upi END),0) upi,
+     COALESCE(SUM(CASE WHEN payment_type='Card' THEN amount ELSE card END),0) card,
+     COALESCE(SUM(CASE WHEN payment_type='Credit' THEN amount ELSE credit END),0) credit,
+     COALESCE(SUM(CASE WHEN payment_type='Personal' THEN amount ELSE 0 END),0) personal,
+     COALESCE(SUM(CASE WHEN payment_type='Others' THEN amount ELSE 0 END),0) others,
+     COALESCE(SUM(CASE WHEN amount > 0 THEN amount ELSE cash+upi+card+credit END),0) total
      FROM shift_payments WHERE shift_entry_id=?`,
     [entryId]
   );
+}
+
+function paymentColumn(paymentType) {
+  if (paymentType === "Cash") return "cash";
+  if (paymentType === "Phone Pay") return "upi";
+  if (paymentType === "Card") return "card";
+  if (paymentType === "Credit") return "credit";
+  return null;
+}
+
+async function getPumpPaymentRows(pumpId, req) {
+  const where = req.user.role === "pump_boy" ? "AND se.user_id=?" : "";
+  const params = req.user.role === "pump_boy" ? [pumpId, req.user.id] : [pumpId];
+  return await all(
+    `SELECT sp.recorded_at time, sp.product, sp.payment_type, sp.amount, sp.note, c.name customer
+     FROM shift_payments sp
+     JOIN shift_entries se ON se.id=sp.shift_entry_id
+     JOIN nozzles n ON n.id=se.nozzle_id
+     LEFT JOIN customers c ON c.id=sp.customer_id
+     WHERE n.pump_id=? AND se.status='Open' ${where}
+     ORDER BY sp.recorded_at DESC, sp.id DESC`,
+    params
+  );
+}
+
+async function getPumpPaymentTotals(pumpId, req) {
+  const rows = await getPumpPaymentRows(pumpId, req);
+  const totals = { cash: 0, phone_pay: 0, card: 0, credit: 0, personal: 0, others: 0, total: 0 };
+  for (const row of rows) {
+    const amount = money(row.amount);
+    if (row.payment_type === "Cash") totals.cash = money(totals.cash + amount);
+    if (row.payment_type === "Phone Pay") totals.phone_pay = money(totals.phone_pay + amount);
+    if (row.payment_type === "Card") totals.card = money(totals.card + amount);
+    if (row.payment_type === "Credit") totals.credit = money(totals.credit + amount);
+    if (row.payment_type === "Personal") totals.personal = money(totals.personal + amount);
+    if (row.payment_type === "Others") totals.others = money(totals.others + amount);
+    totals.total = money(totals.total + amount);
+  }
+  return totals;
 }
 
 async function decrementLargestTank(product, quantity) {
@@ -901,6 +959,14 @@ async function dashboardMetrics() {
        FROM users u JOIN shift_entries se ON se.user_id=u.id
        WHERE se.day_id=? AND se.status='Closed'
        GROUP BY u.id, u.name ORDER BY sales DESC`,
+      [day.id]
+    ),
+    payment_totals: await all(
+      `SELECT sp.payment_type, COALESCE(SUM(sp.amount),0) amount
+       FROM shift_payments sp JOIN shift_entries se ON se.id=sp.shift_entry_id
+       WHERE se.day_id=?
+       GROUP BY sp.payment_type
+       ORDER BY sp.payment_type`,
       [day.id]
     ),
   };
@@ -1235,6 +1301,7 @@ app.get("/", requireLogin, async (req, res) => {
         </div>
         <div class="panel"><div class="panel-title"><h2>Stock Available</h2></div>${m.tank_stock.map((r) => `<div class="ledger-line"><span>${esc(r.product)}</span><strong>${ltr(r.stock)}</strong></div>`).join("")}</div>
         <div class="panel"><div class="panel-title"><h2>Pump-wise Sales</h2></div>${m.pump_sales.map((r) => `<div class="ledger-line"><span>${esc(r.pump)}</span><strong>${rs(r.sales)}</strong></div>`).join("") || '<p class="muted">No pump sales yet.</p>'}</div>
+        <div class="panel"><div class="panel-title"><h2>Payment Split</h2></div>${m.payment_totals.map((r) => `<div class="ledger-line"><span>${esc(r.payment_type || "Unsorted")}</span><strong>${rs(r.amount)}</strong></div>`).join("") || '<p class="muted">No shift payments logged yet.</p>'}</div>
         <div class="panel"><div class="panel-title"><h2>Top Credit Customers</h2></div>${m.top_customers.map((c) => `<div class="ledger-line"><span>${esc(c.name)}</span><strong>${rs(c.balance)}</strong></div>`).join("") || '<p class="muted">No pending customer credit.</p>'}</div>
         <div class="panel wide"><div class="panel-title"><h2>Day Opening Readings</h2><span class="badge">${esc(m.day.business_date)}</span></div>${table(openingRows)}</div>
         <div class="panel wide"><div class="panel-title"><h2>Open Shift Records</h2><span class="badge">${esc(m.open_shifts)} open</span></div>${table(openEntries)}</div>
@@ -1435,23 +1502,26 @@ async function renderDayStart(req, res, values = {}, error = "") {
      WHERE p.status='Active' AND n.status='Active'
      ORDER BY CASE WHEN p.name GLOB 'Pump [0-9]*' THEN CAST(SUBSTR(p.name, 6) AS INTEGER) ELSE 999999 END, p.name`
   );
+  for (const nozzle of nozzles) {
+    nozzle.suggested_opening = (await lastMeter(nozzle.id)) ?? 0;
+  }
   const currentDay = await activeDay();
   const currentRows = currentDay ? await dayOpeningRows(currentDay.id) : [];
   const recentDays = await all("SELECT id, business_date, ms_price, hsd_price, opening_cash, status FROM days ORDER BY business_date DESC LIMIT 10");
   res.send(layout(req, "Day Start", `${pageHead("Start Business Day", "Operations > Day Start")}
     <section class="form-card"><form method="post" class="grid-form">
       ${inlineError(error)}
-      <label class="field"><span>Business date</span><input name="business_date" type="date" value="${esc(fieldValue(values, "business_date", todayIso()))}" required></label>
+      <label class="field"><span>Business date / sales date</span><input name="business_date" type="date" value="${esc(fieldValue(values, "business_date", todayIso()))}" required><small>Opening readings are previous closing readings carried into this date.</small></label>
       <label class="field"><span>Opening cash</span><input name="opening_cash" type="number" step="0.01" value="${esc(fieldValue(values, "opening_cash", ""))}"></label>
       <label class="field"><span>MS price</span><input name="ms_price" type="number" step="0.01" value="${esc(fieldValue(values, "ms_price", ""))}" required></label>
       <label class="field"><span>HSD price</span><input name="hsd_price" type="number" step="0.01" value="${esc(fieldValue(values, "hsd_price", ""))}" required></label>
-      <div class="form-section"><strong>Pump opening meter readings</strong><small>Saved by pump and product for shift start</small></div>
+      <div class="form-section"><strong>Pump opening meter readings</strong><small>Previous closing readings for this business date.</small></div>
       ${pumps.map((p) => {
         const pumpMeters = nozzles
           .filter((n) => Number(n.pump_id) === Number(p.id))
           .map((n) => {
             const name = `meter_${n.id}_opening`;
-            const suggested = lastMeter(n.id) ?? 0;
+            const suggested = n.suggested_opening;
             return `<label class="field"><span>${esc(n.product)}</span><input name="${name}" type="number" step="0.001" value="${esc(fieldValue(values, name, suggested))}" required></label>`;
           })
           .join("");
@@ -1559,6 +1629,9 @@ async function renderShiftStart(req, res, values = {}, error = "") {
      ORDER BY n.product, n.name`,
     [selectedPumpId]
   );
+  for (const nozzle of nozzles) {
+    nozzle.suggested_opening = (await dayOpeningMeter(day.id, nozzle.id)) ?? (await lastMeter(nozzle.id)) ?? 0;
+  }
   const openEntries = (await activePumpGroups(req)).filter((r) => r.business_date === day.business_date);
   res.send(layout(req, "Start Shift", `${pageHead("Start Shift", "Operations > Start Shift")}
     <section class="form-card"><form method="post" class="grid-form">
@@ -1571,7 +1644,7 @@ async function renderShiftStart(req, res, values = {}, error = "") {
       <div class="form-section"><strong>${esc(pumps.find((p) => Number(p.id) === selectedPumpId)?.name || "Pump")}</strong><small>MS and HSD readings</small></div>
       ${nozzles.map((n) => {
         const name = `opening_meter_${n.id}`;
-        const suggested = dayOpeningMeter(day.id, n.id) ?? lastMeter(n.id) ?? 0;
+        const suggested = n.suggested_opening;
         return `<label class="field"><span>${esc(n.product)}</span><input name="${name}" type="number" step="0.001" value="${esc(fieldValue(values, name, suggested))}"></label>`;
       }).join("") || '<div class="form-error span-2">Selected pump is not configured for MS/HSD.</div>'}
       <div class="action-row"><button class="primary" ${pumps.length && users.length && shifts.length && nozzles.length && hasAvailablePump && hasAvailableUser ? "" : "disabled"}>Start Shift</button></div>
@@ -1627,8 +1700,8 @@ app.route("/shift/start")
     let created = 0;
     for (const nozzle of nozzles) {
       let opening = req.body[`opening_meter_${nozzle.id}`];
-      if (opening === "" || opening == null) opening = dayOpeningMeter(day.id, nozzle.id);
-      if (opening === "" || opening == null) opening = lastMeter(nozzle.id);
+      if (opening === "" || opening == null) opening = await dayOpeningMeter(day.id, nozzle.id);
+      if (opening === "" || opening == null) opening = await lastMeter(nozzle.id);
       if (opening == null) {
         return await renderShiftStart(req, res, req.body, `Enter opening meter for ${nozzle.product}.`);
       }
@@ -1647,8 +1720,107 @@ app.route("/shift/start")
 
 app.get("/shifts/active", requireLogin, async (req, res) => {
   let entries = await activePumpGroups(req);
-  entries = entries.map((r) => ({ ...r, actions: `<a class="link-button secondary" href="/shift/pump/${esc(r.pump_id)}/edit">Edit</a>` }));
+  entries = entries.map((r) => ({
+    ...r,
+    actions: `<a class="link-button secondary" href="/shift/pump/${esc(r.pump_id)}/payment">Payments</a> <a class="link-button secondary" href="/shift/pump/${esc(r.pump_id)}/edit">Edit</a>`,
+  }));
   res.send(layout(req, "Active Shifts", `${pageHead("Active Shifts", "Operations > Active Shifts", '<a class="primary link-button" href="/shift/close">Close Shift</a>')}${table(entries)}`));
+});
+
+async function renderPumpPayments(req, res, pump, entries, values = {}, error = "") {
+  const customers = await all("SELECT * FROM customers WHERE status='Active' ORDER BY name");
+  const paymentRows = await getPumpPaymentRows(pump.id, req);
+  const totals = await getPumpPaymentTotals(pump.id, req);
+  res.send(layout(req, "Shift Payments", `${pageHead(`${pump.name} Payments`, "Operations > Active Pump")}
+    <section class="form-card"><form method="post" class="grid-form">
+      ${inlineError(error)}
+      <label class="field"><span>Product</span><select name="product">${entries.map((e) => option(e.product, e.product, fieldValue(values, "product", ""))).join("")}</select></label>
+      <label class="field"><span>Payment type</span><select name="payment_type">${PAYMENT_TYPES.map((p) => option(p, p, fieldValue(values, "payment_type", ""))).join("")}</select></label>
+      <label class="field"><span>Amount</span><input name="amount" type="number" step="0.01" value="${esc(fieldValue(values, "amount", ""))}" required></label>
+      <label class="field"><span>Time</span><input name="recorded_at" type="time" value="${esc(fieldValue(values, "recorded_at", new Date().toTimeString().slice(0, 5)))}"></label>
+      <label class="field"><span>Credit customer</span><select name="customer_id"><option value="">None</option>${customers.map((c) => option(c.id, c.name, fieldValue(values, "customer_id", ""))).join("")}</select><small>Needed only for Credit.</small></label>
+      <label class="field"><span>Note</span><input name="note" value="${esc(fieldValue(values, "note", ""))}"></label>
+      <div class="action-row"><a class="secondary link-button" href="/shifts/active">Back</a><button class="primary">Add Payment</button></div>
+    </form></section>
+    <section class="stat-grid">
+      <div class="stat"><span>Cash</span><strong>${rs(totals.cash)}</strong></div>
+      <div class="stat"><span>Phone Pay</span><strong>${rs(totals.phone_pay)}</strong></div>
+      <div class="stat"><span>Card</span><strong>${rs(totals.card)}</strong></div>
+      <div class="stat"><span>Credit</span><strong>${rs(totals.credit)}</strong></div>
+      <div class="stat"><span>Personal / Others</span><strong>${rs(Number(totals.personal) + Number(totals.others))}</strong></div>
+      <div class="stat hero"><span>Total logged</span><strong>${rs(totals.total)}</strong></div>
+    </section>
+    <section class="table-card"><div class="table-card-head"><div><h2>Payment Log</h2><p>Each payment is timestamped and linked to MS or HSD for this active pump.</p></div></div>${table(paymentRows)}</section>`));
+}
+
+app.get("/shift/pump/:pumpId/payment", requireLogin, async (req, res) => {
+  const pump = await one("SELECT * FROM pumps WHERE id=?", [Number(req.params.pumpId)]);
+  if (!pump) return res.redirect("/shifts/active");
+  const where = req.user.role === "pump_boy" ? "AND se.user_id=?" : "";
+  const params = req.user.role === "pump_boy" ? [pump.id, req.user.id] : [pump.id];
+  const entries = await all(
+    `SELECT se.id, se.product, se.business_date
+     FROM shift_entries se JOIN nozzles n ON n.id=se.nozzle_id
+     WHERE n.pump_id=? AND se.status='Open' ${where}
+     ORDER BY se.product`,
+    params
+  );
+  if (!entries.length) return res.redirect("/shifts/active");
+  await renderPumpPayments(req, res, pump, entries);
+});
+
+app.post("/shift/pump/:pumpId/payment", requireLogin, async (req, res) => {
+  const pump = await one("SELECT * FROM pumps WHERE id=?", [Number(req.params.pumpId)]);
+  if (!pump) return res.redirect("/shifts/active");
+  const where = req.user.role === "pump_boy" ? "AND se.user_id=?" : "";
+  const params = req.user.role === "pump_boy" ? [pump.id, req.user.id] : [pump.id];
+  const entries = await all(
+    `SELECT se.id, se.product, se.business_date
+     FROM shift_entries se JOIN nozzles n ON n.id=se.nozzle_id
+     WHERE n.pump_id=? AND se.status='Open' ${where}
+     ORDER BY se.product`,
+    params
+  );
+  if (!entries.length) return res.redirect("/shifts/active");
+  const product = String(req.body.product || "").trim();
+  const paymentType = String(req.body.payment_type || "").trim();
+  const amount = money(req.body.amount);
+  const entry = entries.find((e) => e.product === product);
+  if (!entry) return await renderPumpPayments(req, res, pump, entries, req.body, "Select MS or HSD for this payment.");
+  if (!PAYMENT_TYPES.includes(paymentType)) return await renderPumpPayments(req, res, pump, entries, req.body, "Select a valid payment type.");
+  if (!amount || amount <= 0) return await renderPumpPayments(req, res, pump, entries, req.body, "Enter payment amount.");
+  if (paymentType === "Credit" && !req.body.customer_id) return await renderPumpPayments(req, res, pump, entries, req.body, "Select credit customer for Credit payment.");
+  const column = paymentColumn(paymentType);
+  const values = { cash: 0, upi: 0, card: 0, credit: 0 };
+  if (column) values[column] = amount;
+  const businessDate = entry.business_date || todayIso();
+  const recordedAt = req.body.recorded_at ? `${businessDate} ${req.body.recorded_at}:00` : undefined;
+  await run(
+    `INSERT INTO shift_payments(shift_entry_id, product, payment_type, amount, cash, upi, card, credit, customer_id, note${recordedAt ? ", recorded_at" : ""})
+     VALUES(?,?,?,?,?,?,?,?,?,?${recordedAt ? ", ?" : ""})`,
+    [
+      entry.id,
+      product,
+      paymentType,
+      amount,
+      values.cash,
+      values.upi,
+      values.card,
+      values.credit,
+      req.body.customer_id || null,
+      req.body.note || "",
+      ...(recordedAt ? [recordedAt] : []),
+    ]
+  );
+  if (paymentType === "Credit") {
+    await run("UPDATE customers SET balance=balance+? WHERE id=?", [amount, Number(req.body.customer_id)]);
+    await run(
+      "INSERT INTO credit_ledger(customer_id, business_date, entry_type, product, amount, pump_nozzle, shift_entry_id, notes) VALUES(?,?,?,?,?,?,?,?)",
+      [Number(req.body.customer_id), businessDate, "credit", product, amount, pump.name, entry.id, req.body.note || "Shift credit logged"]
+    );
+  }
+  flash(req, "success", `${paymentType} payment added for ${product}.`);
+  res.redirect(`/shift/pump/${pump.id}/payment`);
 });
 
 async function renderPumpShiftEdit(req, res, pump, entries, values = {}, error = "") {
@@ -1716,7 +1888,16 @@ async function renderShiftClose(req, res, values = {}, error = "") {
   const customers = await all("SELECT * FROM customers WHERE status='Active' ORDER BY name");
   const selectedPumpId = Number(fieldValue(values, "pump_id", req.query.pump_id || openPumps[0]?.pump_id || ""));
   const selectedPump = openPumps.find((p) => Number(p.pump_id) === selectedPumpId);
+  const loggedTotals = selectedPump ? await getPumpPaymentTotals(selectedPumpId, req) : { cash: 0, phone_pay: 0, card: 0, credit: 0, personal: 0, others: 0, total: 0 };
   res.send(layout(req, "Close Shift", `${pageHead("Close Shift", "Operations > Close Shift")}
+    <section class="stat-grid">
+      <div class="stat"><span>Logged cash</span><strong>${rs(loggedTotals.cash)}</strong></div>
+      <div class="stat"><span>Logged phone pay</span><strong>${rs(loggedTotals.phone_pay)}</strong></div>
+      <div class="stat"><span>Logged card</span><strong>${rs(loggedTotals.card)}</strong></div>
+      <div class="stat"><span>Logged credit</span><strong>${rs(loggedTotals.credit)}</strong></div>
+      <div class="stat"><span>Personal / Others</span><strong>${rs(Number(loggedTotals.personal) + Number(loggedTotals.others))}</strong></div>
+      <div class="stat hero"><span>Total logged</span><strong>${rs(loggedTotals.total)}</strong></div>
+    </section>
     <section class="form-card"><form method="post" class="grid-form">
       ${inlineError(error)}
       <label class="field span-2"><span>Active pump</span><select name="pump_id" onchange="window.location='/shift/close?pump_id='+this.value">${openPumps.map((p) => option(p.pump_id, `${p.business_date} - ${p.pump} - ${p.user_name}`, selectedPumpId)).join("")}</select></label>
@@ -1725,11 +1906,11 @@ async function renderShiftClose(req, res, values = {}, error = "") {
       <label class="field"><span>HSD closing meter</span><input name="closing_HSD" type="number" step="0.001" value="${esc(fieldValue(values, "closing_HSD", selectedPump?.hsd_closing || ""))}" required></label>
       <label class="field"><span>MS testing qty</span><input name="testing_MS" type="number" step="0.001" value="${esc(fieldValue(values, "testing_MS", 0))}"></label>
       <label class="field"><span>HSD testing qty</span><input name="testing_HSD" type="number" step="0.001" value="${esc(fieldValue(values, "testing_HSD", 0))}"></label>
-      <div class="form-section"><strong>Collections</strong><small>Enter total collections for this pump.</small></div>
-      <label class="field"><span>Cash</span><input name="cash" type="number" step="0.01" value="${esc(fieldValue(values, "cash", 0))}"></label>
-      <label class="field"><span>UPI</span><input name="upi" type="number" step="0.01" value="${esc(fieldValue(values, "upi", 0))}"></label>
-      <label class="field"><span>Card</span><input name="card" type="number" step="0.01" value="${esc(fieldValue(values, "card", 0))}"></label>
-      <label class="field"><span>Credit</span><input name="credit" type="number" step="0.01" value="${esc(fieldValue(values, "credit", 0))}"></label>
+      <div class="form-section"><strong>Additional collections</strong><small>Use only for last-minute payments not logged during the shift.</small></div>
+      <label class="field"><span>Extra cash</span><input name="cash" type="number" step="0.01" value="${esc(fieldValue(values, "cash", 0))}"></label>
+      <label class="field"><span>Extra phone pay</span><input name="upi" type="number" step="0.01" value="${esc(fieldValue(values, "upi", 0))}"></label>
+      <label class="field"><span>Extra card</span><input name="card" type="number" step="0.01" value="${esc(fieldValue(values, "card", 0))}"></label>
+      <label class="field"><span>Extra credit</span><input name="credit" type="number" step="0.01" value="${esc(fieldValue(values, "credit", 0))}"></label>
       <label class="field"><span>Credit customer</span><select name="customer_id"><option value="">None</option>${customers.map((c) => option(c.id, c.name, fieldValue(values, "customer_id", ""))).join("")}</select></label>
       <label class="field"><span>Expenses</span><input name="expenses" type="number" step="0.01" value="${esc(fieldValue(values, "expenses", 0))}"></label>
       <label class="field"><span>Expense category</span><select name="expense_category">${DEFAULT_EXPENSE_CATEGORIES.map((c) => option(c, c, fieldValue(values, "expense_category", "Miscellaneous"))).join("")}</select></label>
@@ -1769,26 +1950,29 @@ app.route("/shift/close")
       const amount = money(sold * Number(entry.rate));
       calculated.push({ entry, closing, testingQty, sold, amount });
     }
-    const currentPayments = { cash: 0, upi: 0, card: 0, credit: 0 };
+    const currentPayments = { cash: 0, upi: 0, card: 0, credit: 0, personal: 0, others: 0 };
     for (const item of calculated) {
       const p = await getShiftPaymentsTotal(item.entry.id);
       currentPayments.cash += Number(p.cash || 0);
       currentPayments.upi += Number(p.upi || 0);
       currentPayments.card += Number(p.card || 0);
       currentPayments.credit += Number(p.credit || 0);
+      currentPayments.personal += Number(p.personal || 0);
+      currentPayments.others += Number(p.others || 0);
     }
     const totalAmount = money(calculated.reduce((a, item) => a + item.amount, 0));
     const cash = money(currentPayments.cash + money(req.body.cash));
     const upi = money(currentPayments.upi + money(req.body.upi));
     const card = money(currentPayments.card + money(req.body.card));
-    const credit = money(currentPayments.credit + money(req.body.credit));
+    const extraCredit = money(req.body.credit);
+    const credit = money(currentPayments.credit + extraCredit);
     const expenses = money(req.body.expenses);
     const beta = money(req.body.beta);
-    const misc = money(req.body.miscellaneous);
+    const misc = money(Number(req.body.miscellaneous || 0) + currentPayments.personal + currentPayments.others);
     const shortage = money(cash + upi + card + credit + expenses + beta + misc - totalAmount);
     const customerId = req.body.customer_id || null;
-    if (credit > 0 && !customerId && Number(currentPayments.credit) === 0) {
-      return await renderShiftClose(req, res, req.body, "Select a credit customer for credit sale.");
+    if (extraCredit > 0 && !customerId) {
+      return await renderShiftClose(req, res, req.body, "Select a credit customer for extra credit sale.");
     }
     const share = (value, amount) => (totalAmount > 0 ? money(value * (amount / totalAmount)) : 0);
     for (let i = 0; i < calculated.length; i += 1) {
@@ -1827,10 +2011,10 @@ app.route("/shift/close")
       await run("UPDATE tanks SET current_stock=current_stock-? WHERE id=?", [item.sold, item.entry.tank_id]);
     }
     if (expenses) await run("INSERT INTO expenses(business_date, shift_entry_id, paid_by, category, amount, note, payment_mode) VALUES(?,?,?,?,?,?,?)", [entries[0].business_date, entries[0].id, entries[0].user_id, req.body.expense_category || "Miscellaneous", expenses, req.body.expense_note || "", "Cash"]);
-    if (customerId && credit > 0 && Number(currentPayments.credit) === 0) {
-      await run("UPDATE customers SET balance=balance+? WHERE id=?", [credit, customerId]);
+    if (customerId && extraCredit > 0) {
+      await run("UPDATE customers SET balance=balance+? WHERE id=?", [extraCredit, customerId]);
       for (const item of calculated) {
-        const allocatedCredit = share(credit, item.amount);
+        const allocatedCredit = share(extraCredit, item.amount);
         if (allocatedCredit > 0) await run("INSERT INTO credit_ledger(customer_id, business_date, entry_type, product, litres, amount, pump_nozzle, team_member, shift_entry_id, notes) VALUES(?,?,?,?,?,?,?,?,?,?)", [customerId, item.entry.business_date, "credit", item.entry.product, item.sold, allocatedCredit, item.entry.pump, item.entry.user_name, item.entry.id, req.body.remarks || ""]);
       }
     }
@@ -2013,6 +2197,37 @@ app.get("/reports", requireLogin, async (req, res) => {
      FROM shift_entries se WHERE se.business_date BETWEEN ? AND ? ${extra}`,
     params
   );
+  const paymentRows = await all(
+    `SELECT se.business_date, u.name team_member, p.name pump, sp.product, sp.payment_type,
+     COALESCE(SUM(sp.amount),0) amount, COUNT(*) entries
+     FROM shift_payments sp
+     JOIN shift_entries se ON se.id=sp.shift_entry_id
+     JOIN users u ON u.id=se.user_id
+     JOIN nozzles n ON n.id=se.nozzle_id
+     JOIN pumps p ON p.id=n.pump_id
+     WHERE se.business_date BETWEEN ? AND ? ${extra}
+     GROUP BY se.business_date, u.id, u.name, p.id, p.name, sp.product, sp.payment_type
+     ORDER BY se.business_date DESC, u.name, ${pumpOrderSql("p")}, sp.product, sp.payment_type`,
+    params
+  );
+  const salesmanRows = await all(
+    `SELECT se.business_date, u.name team_member,
+     COALESCE(SUM(CASE WHEN se.product='MS' THEN se.litres_sold ELSE 0 END),0) ms_litres,
+     COALESCE(SUM(CASE WHEN se.product='HSD' THEN se.litres_sold ELSE 0 END),0) hsd_litres,
+     COALESCE(SUM(se.sales_amount),0) sales,
+     COALESCE(SUM(se.cash),0) cash,
+     COALESCE(SUM(se.upi),0) phone_pay,
+     COALESCE(SUM(se.card),0) card,
+     COALESCE(SUM(se.credit),0) credit,
+     COALESCE(SUM(se.miscellaneous),0) personal_others,
+     COALESCE(SUM(se.shortage_excess),0) shortage_excess
+     FROM shift_entries se
+     JOIN users u ON u.id=se.user_id
+     WHERE se.business_date BETWEEN ? AND ? ${extra}
+     GROUP BY se.business_date, u.id, u.name
+     ORDER BY se.business_date DESC, u.name`,
+    params
+  );
   res.send(layout(req, "Reports", `${pageHead("Reports", "Operations > Reports", '<a class="link-button" href="/export/shifts.csv">Export CSV</a>')}
     <section class="form-card"><form method="get" class="grid-form">
       <label class="field"><span>Start</span><input name="start" type="date" value="${esc(start)}"></label>
@@ -2020,8 +2235,10 @@ app.get("/reports", requireLogin, async (req, res) => {
       <label class="field"><span>Product</span><select name="product"><option value="">All</option>${PRODUCTS.map((p) => option(p, p, product)).join("")}</select></label>
       <div class="action-row"><button class="primary">Filter</button></div>
     </form></section>
-    <section class="stat-grid"><div class="stat"><span>Litres</span><strong>${ltr(summary.litres)}</strong></div><div class="stat"><span>Sales</span><strong>${rs(summary.sales)}</strong></div><div class="stat"><span>Cash</span><strong>${rs(summary.cash)}</strong></div><div class="stat"><span>Shortage</span><strong>${rs(summary.shortage)}</strong></div></section>
-    <section class="table-card">${table(shifts)}</section>`));
+    <section class="stat-grid"><div class="stat"><span>Litres</span><strong>${ltr(summary.litres)}</strong></div><div class="stat"><span>Sales</span><strong>${rs(summary.sales)}</strong></div><div class="stat"><span>Cash</span><strong>${rs(summary.cash)}</strong></div><div class="stat"><span>Phone Pay</span><strong>${rs(summary.upi)}</strong></div><div class="stat"><span>Credit</span><strong>${rs(summary.credit)}</strong></div><div class="stat"><span>Shortage</span><strong>${rs(summary.shortage)}</strong></div></section>
+    <section class="table-card"><div class="table-card-head"><div><h2>Complete Sales Data</h2><p>Pump-wise MS/HSD sales grouped for the selected dates.</p></div></div>${table(shifts)}</section>
+    <section class="table-card"><div class="table-card-head"><div><h2>Salesman Date Data</h2><p>Daily totals by team member.</p></div></div>${table(salesmanRows)}</section>
+    <section class="table-card"><div class="table-card-head"><div><h2>Payment Log Summary</h2><p>Payments logged during active shifts by type and product.</p></div></div>${table(paymentRows)}</section>`));
 });
 
 app.get("/export/shifts.csv", requireLogin, requireRoles("admin", "manager"), async (_req, res) => {
