@@ -1569,11 +1569,12 @@ async function dayOpeningRows(dayId) {
 async function dayReportRows(dayId) {
   const rows = await all(
     `SELECT d.business_date, d.ms_price, d.hsd_price, p.id pump_id, p.name pump, n.product,
-     dnr.opening_meter, dnr.closing_meter
+     dnr.opening_meter, dnr.closing_meter, COALESCE(dpt.ms_qty,0) ms_test, COALESCE(dpt.hsd_qty,0) hsd_test
      FROM day_nozzle_readings dnr
      JOIN days d ON d.id=dnr.day_id
      JOIN nozzles n ON n.id=dnr.nozzle_id
      JOIN pumps p ON p.id=n.pump_id
+     LEFT JOIN day_pump_testing dpt ON dpt.day_id=d.id AND dpt.pump_id=p.id
      WHERE d.id=?
      ORDER BY ${pumpOrderSql("p")}, n.product, n.name`,
     [dayId]
@@ -1588,10 +1589,12 @@ async function dayReportRows(dayId) {
         pump: row.pump,
         ms_opening: "",
         ms_closing: "",
+        ms_test: 0,
         ms_litres: 0,
         ms_sales: 0,
         hsd_opening: "",
         hsd_closing: "",
+        hsd_test: 0,
         hsd_litres: 0,
         hsd_sales: 0,
         total_sales: 0,
@@ -1600,18 +1603,22 @@ async function dayReportRows(dayId) {
     const item = grouped.get(row.pump_id);
     const opening = Number(row.opening_meter || 0);
     const closing = row.closing_meter == null || row.closing_meter === "" ? null : Number(row.closing_meter);
-    const sold = closing == null ? 0 : litres(closing - opening);
+    const grossSold = closing == null ? 0 : litres(closing - opening);
     if (row.product === "MS") {
+      const testQty = litres(row.ms_test || 0);
       item.ms_opening = opening;
       item.ms_closing = closing ?? "";
-      item.ms_litres = sold;
-      item.ms_sales = money(sold * item.ms_price);
+      item.ms_test = testQty;
+      item.ms_litres = litres(grossSold - testQty);
+      item.ms_sales = money(item.ms_litres * item.ms_price);
     }
     if (row.product === "HSD") {
+      const testQty = litres(row.hsd_test || 0);
       item.hsd_opening = opening;
       item.hsd_closing = closing ?? "";
-      item.hsd_litres = sold;
-      item.hsd_sales = money(sold * item.hsd_price);
+      item.hsd_test = testQty;
+      item.hsd_litres = litres(grossSold - testQty);
+      item.hsd_sales = money(item.hsd_litres * item.hsd_price);
     }
     item.total_sales = money(Number(item.ms_sales || 0) + Number(item.hsd_sales || 0));
   }
@@ -1622,14 +1629,16 @@ function renderDayReport(day, rows) {
   if (!day || !rows || !rows.length) return "";
   const totals = rows.reduce(
     (acc, row) => {
+      acc.ms_test = litres(acc.ms_test + Number(row.ms_test || 0));
       acc.ms_litres = litres(acc.ms_litres + Number(row.ms_litres || 0));
       acc.ms_sales = money(acc.ms_sales + Number(row.ms_sales || 0));
+      acc.hsd_test = litres(acc.hsd_test + Number(row.hsd_test || 0));
       acc.hsd_litres = litres(acc.hsd_litres + Number(row.hsd_litres || 0));
       acc.hsd_sales = money(acc.hsd_sales + Number(row.hsd_sales || 0));
       acc.total_sales = money(acc.total_sales + Number(row.total_sales || 0));
       return acc;
     },
-    { ms_litres: 0, ms_sales: 0, hsd_litres: 0, hsd_sales: 0, total_sales: 0 }
+    { ms_test: 0, ms_litres: 0, ms_sales: 0, hsd_test: 0, hsd_litres: 0, hsd_sales: 0, total_sales: 0 }
   );
   const fmtNum = (value) => (value === "" || value == null ? "" : litres(value).toFixed(3).replace(/\.?0+$/, ""));
   const rowHtml = rows.map((row) => `
@@ -1637,18 +1646,20 @@ function renderDayReport(day, rows) {
       <td><strong>${esc(row.pump)}</strong></td>
       <td>${esc(fmtNum(row.ms_opening))}</td>
       <td>${esc(fmtNum(row.ms_closing))}</td>
+      <td>${esc(fmtNum(row.ms_test))}</td>
       <td>${esc(fmtNum(row.ms_litres))}</td>
       <td>${esc(rs(row.ms_sales))}</td>
       <td>${esc(fmtNum(row.hsd_opening))}</td>
       <td>${esc(fmtNum(row.hsd_closing))}</td>
+      <td>${esc(fmtNum(row.hsd_test))}</td>
       <td>${esc(fmtNum(row.hsd_litres))}</td>
       <td>${esc(rs(row.hsd_sales))}</td>
       <td><strong>${esc(rs(row.total_sales))}</strong></td>
     </tr>`).join("");
   return `<section class="table-card"><div class="table-card-head"><div><h2>Day Report</h2><p>Owner account for ${esc(day.business_date)}. Independent of shifts and salespeople.</p></div><span class="badge">${esc(day.status)}</span></div>
     <div class="table-wrap"><table>
-      <thead><tr><th>Pump</th><th>MS opening</th><th>MS closing</th><th>MS litres</th><th>MS sales (${esc(money(day.ms_price).toFixed(2))})</th><th>HSD opening</th><th>HSD closing</th><th>HSD litres</th><th>HSD sales (${esc(money(day.hsd_price).toFixed(2))})</th><th>Total sales</th></tr></thead>
-      <tbody>${rowHtml}<tr><td><strong>Total</strong></td><td></td><td></td><td><strong>${esc(fmtNum(totals.ms_litres))}</strong></td><td><strong>${esc(rs(totals.ms_sales))}</strong></td><td></td><td></td><td><strong>${esc(fmtNum(totals.hsd_litres))}</strong></td><td><strong>${esc(rs(totals.hsd_sales))}</strong></td><td><strong>${esc(rs(totals.total_sales))}</strong></td></tr></tbody>
+      <thead><tr><th>Pump</th><th>MS opening</th><th>MS closing</th><th>MS test</th><th>MS litres</th><th>MS sales (${esc(money(day.ms_price).toFixed(2))})</th><th>HSD opening</th><th>HSD closing</th><th>HSD test</th><th>HSD litres</th><th>HSD sales (${esc(money(day.hsd_price).toFixed(2))})</th><th>Total sales</th></tr></thead>
+      <tbody>${rowHtml}<tr><td><strong>Total</strong></td><td></td><td></td><td><strong>${esc(fmtNum(totals.ms_test))}</strong></td><td><strong>${esc(fmtNum(totals.ms_litres))}</strong></td><td><strong>${esc(rs(totals.ms_sales))}</strong></td><td></td><td></td><td><strong>${esc(fmtNum(totals.hsd_test))}</strong></td><td><strong>${esc(fmtNum(totals.hsd_litres))}</strong></td><td><strong>${esc(rs(totals.hsd_sales))}</strong></td><td><strong>${esc(rs(totals.total_sales))}</strong></td></tr></tbody>
     </table></div></section>`;
 }
 
