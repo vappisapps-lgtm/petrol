@@ -408,6 +408,52 @@ function adminResetConfig() {
   return null;
 }
 
+function ensurePumpNozzleSetup() {
+  const station = one("SELECT * FROM station WHERE id=1") || {};
+  const existingNozzles = Number(one("SELECT COUNT(*) c FROM nozzles WHERE status='Active'").c || 0);
+  const existingPumps = Number(one("SELECT COUNT(*) c FROM pumps WHERE status='Active'").c || 0);
+  const pumpCount = Math.max(Number(station.pumps_count || 0), existingPumps, existingNozzles ? 0 : 2);
+  if (!pumpCount) return;
+  const tankIds = {};
+  for (const product of PRODUCTS) {
+    let tank = one("SELECT * FROM tanks WHERE product=? AND status='Active' ORDER BY id LIMIT 1", [product]);
+    if (!tank) {
+      const created = run("INSERT INTO tanks(name, product, capacity, opening_dip, current_stock, status) VALUES(?,?,?,?,?,?)", [
+        `${product} Tank`,
+        product,
+        20000,
+        0,
+        0,
+        "Active",
+      ]);
+      tank = one("SELECT * FROM tanks WHERE id=?", [created.lastInsertRowid]);
+    }
+    tankIds[product] = tank.id;
+  }
+  for (let i = 1; i <= pumpCount; i += 1) {
+    const pumpName = `Pump ${i}`;
+    let pump = one("SELECT * FROM pumps WHERE name=?", [pumpName]);
+    if (!pump) {
+      const created = run("INSERT INTO pumps(name, status) VALUES(?,?)", [pumpName, "Active"]);
+      pump = one("SELECT * FROM pumps WHERE id=?", [created.lastInsertRowid]);
+    } else if (pump.status !== "Active") {
+      run("UPDATE pumps SET status='Active' WHERE id=?", [pump.id]);
+    }
+    for (const product of PRODUCTS) {
+      const exists = one("SELECT id FROM nozzles WHERE pump_id=? AND product=? AND status='Active'", [pump.id, product]);
+      if (!exists) {
+        run("INSERT INTO nozzles(pump_id, name, product, tank_id, status) VALUES(?,?,?,?,?)", [
+          pump.id,
+          `${pumpName} ${product}`,
+          product,
+          tankIds[product],
+          "Active",
+        ]);
+      }
+    }
+  }
+}
+
 function dashboardMetrics() {
   const day = activeDay();
   if (!day) return { day: null };
@@ -744,13 +790,14 @@ app.get("/", requireLogin, (req, res) => {
 app.route("/station")
   .get(requireLogin, requireRoles("admin"), (req, res) => {
     const s = req.station || {};
+    const defaultPumpCount = s.pumps_count || one("SELECT COUNT(*) c FROM pumps WHERE status='Active'").c || 2;
     res.send(
       layout(req, "Station", `${pageHead("Station Settings", "Setup > Station")}
       <section class="form-card"><form method="post" class="grid-form">
         ${["station_name", "owner_name", "location", "contact"].map((k) => `<label class="field"><span>${esc(k.replaceAll("_", " "))}</span><input name="${k}" value="${esc(s[k])}"></label>`).join("")}
         <label class="field span-2"><span>Address</span><textarea name="address">${esc(s.address)}</textarea></label>
-        <label class="field"><span>Pumps count</span><input name="pumps_count" type="number" value="${esc(s.pumps_count || 0)}"></label>
-        <label class="field"><span>Nozzles per pump</span><input name="nozzles_per_pump" type="number" value="${esc(s.nozzles_per_pump || 0)}"></label>
+        <label class="field"><span>Pumps count</span><input name="pumps_count" type="number" value="${esc(defaultPumpCount)}"></label>
+        <label class="field"><span>Nozzles per pump</span><input name="nozzles_per_pump" type="number" value="${esc(s.nozzles_per_pump || 2)}"></label>
         <label class="field"><span>Default testing qty</span><input name="default_testing_qty" type="number" step="0.001" value="${esc(s.default_testing_qty || 5)}"></label>
         <label class="field"><span>Beta enabled</span><select name="beta_enabled">${option("1", "Yes", s.beta_enabled ? "1" : "")}${option("", "No", s.beta_enabled ? "" : "")}</select></label>
         <div class="action-row"><button class="primary">Save Station</button></div>
@@ -864,6 +911,7 @@ function dayOpeningRows(dayId) {
 }
 
 function renderDayStart(req, res, values = {}, error = "") {
+  ensurePumpNozzleSetup();
   const tanks = all("SELECT * FROM tanks WHERE status='Active' ORDER BY product, name");
   const nozzles = all(
     `SELECT n.*, p.name pump
@@ -947,6 +995,7 @@ app.route("/day/start")
   });
 
 function renderShiftStart(req, res, values = {}, error = "") {
+  ensurePumpNozzleSetup();
   const day = activeDay();
   if (!day) {
     flash(req, "error", "Start a business day before opening shifts.");
