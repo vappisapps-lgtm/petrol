@@ -88,6 +88,10 @@
 
 - Day data is independent of shifts and runs 6 AM to 6 AM.
 - Shift data runs 9 AM to next day 9 AM, and salespeople may change by shift.
+- Shift calculations must use actual time in and actual time out, not a preselected shift definition.
+- Shift definitions are used only to classify the closed shift in reports; if the actual time range does not fit a configured shift, show it as a custom shift.
+- If a shift crosses 6 AM, split the salesperson report clearly into before-6AM litres and after-6AM litres.
+- The after-6AM portion belongs to whoever was active on that pump during that time, no matter what time the previous handover happened.
 - If the selling price changes for a day, the sales reports should show old price and new price difference for the 6 AM to 9 AM overlap.
 - Old price comes from the previous closed day.
 - New price comes from the selected business day.

@@ -685,6 +685,68 @@ async function detectShift(timeStr) {
   return shifts[0];
 }
 
+function timeMinutes(value) {
+  const [hours, minutes] = String(value || "00:00").slice(0, 5).split(":").map(Number);
+  return (Number(hours) || 0) * 60 + (Number(minutes) || 0);
+}
+
+function addDaysIso(dateIso, days) {
+  const date = new Date(`${dateIso}T00:00:00Z`);
+  date.setUTCDate(date.getUTCDate() + days);
+  return date.toISOString().slice(0, 10);
+}
+
+function timestampForBusinessTime(businessDate, timeValue) {
+  const time = String(timeValue || new Date().toTimeString().slice(0, 5)).slice(0, 5);
+  const date = timeMinutes(time) < timeMinutes("06:00") ? addDaysIso(businessDate, 1) : businessDate;
+  return `${date} ${time}:00`;
+}
+
+function closingTimestampForBusinessTime(businessDate, timeValue, openedAt) {
+  let timestamp = timestampForBusinessTime(businessDate, timeValue);
+  if (openedAt && timestamp <= String(openedAt)) {
+    timestamp = `${addDaysIso(timestamp.slice(0, 10), 1)} ${timestamp.slice(11)}`;
+  }
+  return timestamp;
+}
+
+function clockFromTimestamp(value) {
+  return value ? String(value).slice(11, 16) : "";
+}
+
+function dateFromTimestamp(value) {
+  return value ? String(value).slice(0, 10) : "";
+}
+
+function shiftWindowForDate(dateIso, shift) {
+  const start = `${dateIso} ${String(shift.start_time).slice(0, 5)}:00`;
+  let endDate = dateIso;
+  if (timeMinutes(shift.end_time) <= timeMinutes(shift.start_time)) endDate = addDaysIso(dateIso, 1);
+  const end = `${endDate} ${String(shift.end_time).slice(0, 5)}:00`;
+  return { start, end };
+}
+
+function matchedShiftName(openedAt, closedAt, shiftDefs, fallback = "") {
+  if (!openedAt || !closedAt) return fallback || "Live shift";
+  const open = String(openedAt);
+  const close = String(closedAt);
+  const openDate = dateFromTimestamp(open);
+  const dates = [addDaysIso(openDate, -1), openDate, addDaysIso(openDate, 1)];
+  for (const date of dates) {
+    for (const shift of shiftDefs) {
+      const window = shiftWindowForDate(date, shift);
+      if (open >= window.start && close <= window.end) return shift.name;
+    }
+  }
+  return `Custom ${clockFromTimestamp(open)}-${clockFromTimestamp(close)}`;
+}
+
+function crossesBusinessBoundary(businessDate, openedAt, closedAt) {
+  if (!openedAt || !closedAt) return false;
+  const boundary = `${addDaysIso(businessDate, 1)} 06:00:00`;
+  return String(openedAt) < boundary && String(closedAt) > boundary;
+}
+
 async function getShiftPaymentsTotal(entryId) {
   return await one(
     `SELECT
@@ -928,6 +990,8 @@ function groupPumpEntries(entries) {
         pump: e.pump,
         user_name: e.user_name,
         shift_name: e.shift_name,
+        time_in: clockFromTimestamp(e.opened_at),
+        time_out: clockFromTimestamp(e.closed_at),
         ms_opening: "",
         hsd_opening: "",
         ms_closing: "",
@@ -954,7 +1018,7 @@ async function activePumpGroups(req) {
   return groupPumpEntries(
     await all(
       `SELECT se.id, se.business_date, p.id pump_id, p.name pump, se.product, u.name user_name, sd.name shift_name,
-       se.opening_meter, se.closing_meter, se.status
+       se.opening_meter, se.closing_meter, se.status, se.opened_at, se.closed_at
        FROM shift_entries se
        JOIN users u ON u.id=se.user_id
        JOIN shift_defs sd ON sd.id=se.shift_def_id
@@ -1714,25 +1778,34 @@ function addPriceAdjustmentFields(row, priceByDate, dayClosingByKey) {
   const hsdDayClosing = dayClosingByKey.get(`${row.business_date}-${row.pump_id}-HSD`);
   const msReportClosing = meterOrNull(row.ms_closing);
   const hsdReportClosing = meterOrNull(row.hsd_closing);
-  const msPriceDiffLitres = msReportClosing == null || msDayClosing == null ? 0 : litres(Math.max(0, msReportClosing - msDayClosing));
-  const hsdPriceDiffLitres = hsdReportClosing == null || hsdDayClosing == null ? 0 : litres(Math.max(0, hsdReportClosing - hsdDayClosing));
+  const crossesBoundary = crossesBusinessBoundary(row.business_date, row.opened_at, row.closed_at);
+  const msAfter6Litres = !crossesBoundary || msReportClosing == null || msDayClosing == null ? 0 : litres(Math.max(0, msReportClosing - msDayClosing));
+  const hsdAfter6Litres = !crossesBoundary || hsdReportClosing == null || hsdDayClosing == null ? 0 : litres(Math.max(0, hsdReportClosing - hsdDayClosing));
+  const msBefore6Litres = litres(Math.max(0, Number(row.ms_litres || 0) - msAfter6Litres));
+  const hsdBefore6Litres = litres(Math.max(0, Number(row.hsd_litres || 0) - hsdAfter6Litres));
 
   return {
     ...row,
     ms_old_price: prices.ms_old_price,
     ms_new_price: prices.ms_new_price,
-    ms_price_diff_litres: msPriceDiffLitres,
-    ms_price_difference: money(msPriceDiffLitres * (prices.ms_new_price - prices.ms_old_price)),
+    ms_before_6_litres: msBefore6Litres,
+    ms_after_6_litres: msAfter6Litres,
+    ms_price_diff_litres: msAfter6Litres,
+    ms_price_difference: money(msAfter6Litres * (prices.ms_new_price - prices.ms_old_price)),
     hsd_old_price: prices.hsd_old_price,
     hsd_new_price: prices.hsd_new_price,
-    hsd_price_diff_litres: hsdPriceDiffLitres,
-    hsd_price_difference: money(hsdPriceDiffLitres * (prices.hsd_new_price - prices.hsd_old_price)),
+    hsd_before_6_litres: hsdBefore6Litres,
+    hsd_after_6_litres: hsdAfter6Litres,
+    hsd_price_diff_litres: hsdAfter6Litres,
+    hsd_price_difference: money(hsdAfter6Litres * (prices.hsd_new_price - prices.hsd_old_price)),
   };
 }
 
 async function shiftWiseSalesRows(dayId) {
-  return await all(
+  const shiftDefs = await all("SELECT * FROM shift_defs WHERE status='Active' ORDER BY start_time");
+  const rows = await all(
     `SELECT se.business_date, sd.name shift, p.name pump, u.name salesperson, u.mobile login_id,
+     MIN(se.opened_at) opened_at, MAX(se.closed_at) closed_at,
      COALESCE(SUM(CASE WHEN se.product='MS' THEN se.litres_sold ELSE 0 END),0) ms_litres,
      COALESCE(SUM(CASE WHEN se.product='MS' THEN se.sales_amount ELSE 0 END),0) ms_sales,
      COALESCE(SUM(CASE WHEN se.product='HSD' THEN se.litres_sold ELSE 0 END),0) hsd_litres,
@@ -1748,11 +1821,17 @@ async function shiftWiseSalesRows(dayId) {
      ORDER BY se.business_date DESC, sd.start_time, ${pumpOrderSql("p")}, u.name`,
     [dayId]
   );
+  return rows.map((row) => ({
+    ...row,
+    shift: matchedShiftName(row.opened_at, row.closed_at, shiftDefs, row.shift),
+    time_in: clockFromTimestamp(row.opened_at),
+    time_out: clockFromTimestamp(row.closed_at),
+  }));
 }
 
 function renderShiftWiseSalesReport(day, rows) {
   if (!day) return "";
-  return `<section class="table-card"><div class="table-card-head"><div><h2>Shift-wise Sales Report</h2><p>Sales by shift, pump and salesperson for ${esc(day.business_date)}.</p></div></div>${tableColumns(rows || [], ["business_date", "shift", "pump", "salesperson", "login_id", "ms_litres", "ms_sales", "hsd_litres", "hsd_sales", "total_sales"])}</section>`;
+  return `<section class="table-card"><div class="table-card-head"><div><h2>Shift-wise Sales Report</h2><p>Sales by shift, pump and salesperson for ${esc(day.business_date)}.</p></div></div>${tableColumns(rows || [], ["business_date", "shift", "time_in", "time_out", "pump", "salesperson", "login_id", "ms_litres", "ms_sales", "hsd_litres", "hsd_sales", "total_sales"])}</section>`;
 }
 
 async function renderDayStart(req, res, values = {}, error = "") {
@@ -1911,7 +1990,6 @@ async function renderShiftStart(req, res, values = {}, error = "") {
   }
   const pumps = await all("SELECT * FROM pumps WHERE status='Active' ORDER BY CASE WHEN name GLOB 'Pump [0-9]*' THEN CAST(SUBSTR(name, 6) AS INTEGER) ELSE 999999 END, name");
   const users = await all("SELECT * FROM users WHERE status='Active' AND role IN ('manager','pump_boy') ORDER BY name");
-  const shifts = await all("SELECT * FROM shift_defs WHERE status='Active' ORDER BY start_time");
   const activePumpRows = await all(
     `SELECT DISTINCT p.id
      FROM shift_entries se JOIN nozzles n ON n.id=se.nozzle_id JOIN pumps p ON p.id=n.pump_id
@@ -1942,7 +2020,6 @@ async function renderShiftStart(req, res, values = {}, error = "") {
       <label class="field"><span>Pump</span><select name="pump_id" onchange="if(!this.selectedOptions[0].disabled) window.location='/shift/start?pump_id='+this.value">${pumps.map((p) => optionDisabled(p.id, activePumpIds.has(Number(p.id)) ? `${p.name} - active` : p.name, selectedPumpId, activePumpIds.has(Number(p.id)))).join("")}</select></label>
       <label class="field"><span>Team member</span><select name="user_id">${users.map((u) => optionDisabled(u.id, activeUserIds.has(Number(u.id)) ? `${u.name} - assigned` : u.name, selectedUserId, activeUserIds.has(Number(u.id)))).join("")}</select></label>
       <label class="field"><span>Time in</span><input name="time_in" type="time" value="${esc(fieldValue(values, "time_in", new Date().toTimeString().slice(0, 5)))}"></label>
-      <label class="field"><span>Detected shift</span><select name="shift_def_id"><option value="">Auto by time</option>${shifts.map((s) => option(s.id, `${s.name} (${s.start_time}-${s.end_time})`, fieldValue(values, "shift_def_id", ""))).join("")}</select></label>
       <div class="form-section"><strong>Opening meters</strong><small>Defaults come from the day-start pump readings</small></div>
       <div class="form-section"><strong>${esc(pumps.find((p) => Number(p.id) === selectedPumpId)?.name || "Pump")}</strong><small>MS and HSD readings</small></div>
       ${nozzles.map((n) => {
@@ -1950,7 +2027,7 @@ async function renderShiftStart(req, res, values = {}, error = "") {
         const suggested = n.suggested_opening;
         return `<label class="field"><span>${esc(n.product)}</span><input name="${name}" type="number" step="0.001" value="${esc(fieldValue(values, name, suggested))}"></label>`;
       }).join("") || '<div class="form-error span-2">Selected pump is not configured for MS/HSD.</div>'}
-      <div class="action-row"><button class="primary" ${pumps.length && users.length && shifts.length && nozzles.length && hasAvailablePump && hasAvailableUser ? "" : "disabled"}>Start Shift</button></div>
+      <div class="action-row"><button class="primary" ${pumps.length && users.length && nozzles.length && hasAvailablePump && hasAvailableUser ? "" : "disabled"}>Start Shift</button></div>
     </form></section>
     <section class="table-card"><div class="table-card-head"><div><h2>Open Shift Records</h2><p>${esc(day.business_date)} active shift records.</p></div></div>${table(openEntries)}</section>`));
 }
@@ -1964,7 +2041,7 @@ app.route("/shift/start")
     if (!day) return res.redirect("/day/start");
     const pumpId = Number(req.body.pump_id);
     const userId = req.user.role === "pump_boy" ? req.user.id : Number(req.body.user_id || req.user.id);
-    const shift = req.body.shift_def_id ? await one("SELECT * FROM shift_defs WHERE id=? AND status='Active'", [Number(req.body.shift_def_id)]) : await detectShift(req.body.time_in);
+    const shift = await detectShift(req.body.time_in);
     if (!pumpId || !await one("SELECT id FROM pumps WHERE id=? AND status='Active'", [pumpId])) {
       return await renderShiftStart(req, res, req.body, "Select an active pump.");
     }
@@ -1972,7 +2049,7 @@ app.route("/shift/start")
       return await renderShiftStart(req, res, req.body, "Select an active team member.");
     }
     if (!shift) {
-      return await renderShiftStart(req, res, req.body, "Add at least one active shift definition before starting a shift.");
+      return await renderShiftStart(req, res, req.body, "Add at least one active shift definition. Reports can still classify custom timing after close.");
     }
     const openPump = await one(
       `SELECT p.name pump, u.name user_name
@@ -2000,6 +2077,7 @@ app.route("/shift/start")
     if (!nozzles.length) {
       return await renderShiftStart(req, res, req.body, "Selected pump is not configured for MS/HSD.");
     }
+    const openedAt = timestampForBusinessTime(day.business_date, req.body.time_in);
     let created = 0;
     for (const nozzle of nozzles) {
       let opening = req.body[`opening_meter_${nozzle.id}`];
@@ -2010,9 +2088,9 @@ app.route("/shift/start")
       }
       if (await one("SELECT id FROM shift_entries WHERE nozzle_id=? AND status='Open'", [nozzle.id])) continue;
       await run(
-        `INSERT INTO shift_entries(day_id, business_date, shift_def_id, user_id, nozzle_id, tank_id, product, opening_meter, rate)
-         VALUES(?,?,?,?,?,?,?,?,?)`,
-        [day.id, day.business_date, shift.id, userId, nozzle.id, nozzle.tank_id, nozzle.product, Number(opening), productPrice(day, nozzle.product)]
+        `INSERT INTO shift_entries(day_id, business_date, shift_def_id, user_id, nozzle_id, tank_id, product, opening_meter, rate, opened_at)
+         VALUES(?,?,?,?,?,?,?,?,?,?)`,
+        [day.id, day.business_date, shift.id, userId, nozzle.id, nozzle.tank_id, nozzle.product, Number(opening), productPrice(day, nozzle.product), openedAt]
       );
       created += 1;
     }
@@ -2027,7 +2105,7 @@ app.get("/shifts/active", requireLogin, async (req, res) => {
     ...r,
     actions: `<a class="link-button secondary" href="/shift/pump/${esc(r.pump_id)}/payment">Payments</a> <a class="link-button secondary" href="/shift/pump/${esc(r.pump_id)}/edit">Edit</a>`,
   }));
-  res.send(layout(req, "Active Shifts", `${pageHead("Active Shifts", "Operations > Active Shifts", '<a class="primary link-button" href="/shift/close">Close Shift</a>')}${tableColumns(entries, ["business_date", "pump", "user_name", "shift_name", "ms_opening", "hsd_opening", "ms_closing", "hsd_closing", "status", "actions"])}`));
+  res.send(layout(req, "Active Shifts", `${pageHead("Active Shifts", "Operations > Active Shifts", '<a class="primary link-button" href="/shift/close">Close Shift</a>')}${tableColumns(entries, ["business_date", "pump", "user_name", "shift_name", "time_in", "ms_opening", "hsd_opening", "ms_closing", "hsd_closing", "status", "actions"])}`));
 });
 
 async function renderPumpPayments(req, res, pump, entries, values = {}, error = "") {
@@ -2216,6 +2294,7 @@ async function renderShiftClose(req, res, values = {}, error = "") {
       <div class="form-section"><strong>${esc(selectedPump?.pump || "Pump")} opening readings</strong><small>Captured when the shift started.</small></div>
       <label class="field"><span>MS opening meter</span><input value="${esc(selectedPump?.ms_opening ?? "")}" readonly></label>
       <label class="field"><span>HSD opening meter</span><input value="${esc(selectedPump?.hsd_opening ?? "")}" readonly></label>
+      <label class="field"><span>Time out</span><input name="time_out" type="time" value="${esc(fieldValue(values, "time_out", new Date().toTimeString().slice(0, 5)))}"></label>
       <div class="form-section"><strong>${esc(selectedPump?.pump || "Pump")} closing meters</strong><small>Close MS and HSD together for this pump.</small></div>
       <label class="field"><span>MS closing meter</span><input name="closing_MS" type="number" step="0.001" value="${esc(fieldValue(values, "closing_MS", selectedPump?.ms_closing || ""))}" required></label>
       <label class="field"><span>HSD closing meter</span><input name="closing_HSD" type="number" step="0.001" value="${esc(fieldValue(values, "closing_HSD", selectedPump?.hsd_closing || ""))}" required></label>
@@ -2227,7 +2306,7 @@ async function renderShiftClose(req, res, values = {}, error = "") {
       <div class="action-row"><button class="primary" ${openPumps.length ? "" : "disabled"}>Close Pump</button></div>
     </form></section>
     <section class="table-card"><div class="table-card-head"><div><h2>Logged Payments</h2><p>These payments will be used for closing tally.</p></div></div>${tableColumns(paymentRows, ["time", "pump", "salesperson", "payment_type", "amount", "customer", "note"])}</section>
-    <section class="table-card">${tableColumns(openPumps, ["business_date", "pump", "user_name", "shift_name", "ms_opening", "hsd_opening", "status"])}</section>`));
+    <section class="table-card">${tableColumns(openPumps, ["business_date", "pump", "user_name", "shift_name", "time_in", "ms_opening", "hsd_opening", "status"])}</section>`));
 }
 
 app.route("/shift/close")
@@ -2249,6 +2328,8 @@ app.route("/shift/close")
       params
     );
     if (!entries.length) return await renderShiftClose(req, res, req.body, "Active pump not found.");
+    const openedAt = entries.reduce((earliest, entry) => !earliest || String(entry.opened_at) < earliest ? String(entry.opened_at) : earliest, "");
+    const closedAt = closingTimestampForBusinessTime(entries[0].business_date, req.body.time_out, openedAt);
     const calculated = [];
     for (const entry of entries) {
       const closing = Number(req.body[`closing_${entry.product}`]);
@@ -2293,7 +2374,7 @@ app.route("/shift/close")
       await run(
         `UPDATE shift_entries SET closing_meter=?, litres_sold=?, sales_amount=?, cash=?, upi=?, card=?, credit=?,
          customer_id=?, expenses=?, beta=?, miscellaneous=?, remarks=?, shortage_excess=?, testing_qty=?, status='Closed',
-         closed_at=CURRENT_TIMESTAMP WHERE id=?`,
+         closed_at=? WHERE id=?`,
         [
           item.closing,
           item.sold,
@@ -2309,6 +2390,7 @@ app.route("/shift/close")
           req.body.remarks || "",
           allocatedShortage,
           item.testingQty,
+          closedAt,
           item.entry.id,
         ]
       );
@@ -2495,9 +2577,10 @@ app.get("/reports", requireLogin, async (req, res) => {
   const users = req.user.role === "pump_boy"
     ? []
     : await all("SELECT id, name FROM users WHERE status='Active' AND role IN ('admin','manager','pump_boy') ORDER BY name");
+  const shiftDefs = await all("SELECT * FROM shift_defs WHERE status='Active' ORDER BY start_time");
   const shiftRows = await all(
     `SELECT se.business_date, d.ms_price, d.hsd_price, p.id pump_id, p.name pump, u.name user_name, sd.name shift_name, se.product,
-     se.opening_meter, se.closing_meter, se.litres_sold, se.sales_amount, se.cash, se.upi, se.credit, se.expenses, se.beta, se.miscellaneous, se.shortage_excess, se.status
+     se.opened_at, se.closed_at, se.opening_meter, se.closing_meter, se.litres_sold, se.sales_amount, se.cash, se.upi, se.credit, se.expenses, se.beta, se.miscellaneous, se.shortage_excess, se.status
      FROM shift_entries se JOIN users u ON u.id=se.user_id JOIN shift_defs sd ON sd.id=se.shift_def_id
      JOIN nozzles n ON n.id=se.nozzle_id JOIN pumps p ON p.id=n.pump_id
      LEFT JOIN days d ON d.id=se.day_id
@@ -2507,14 +2590,19 @@ app.get("/reports", requireLogin, async (req, res) => {
   );
   const reportMap = new Map();
   for (const row of shiftRows) {
-    const key = `${row.business_date}-${row.pump_id}-${row.user_name}-${row.shift_name}-${row.status}`;
+    const shiftName = matchedShiftName(row.opened_at, row.closed_at, shiftDefs, row.shift_name);
+    const key = `${row.business_date}-${row.pump_id}-${row.user_name}-${shiftName}-${row.opened_at}-${row.closed_at}-${row.status}`;
     if (!reportMap.has(key)) {
       reportMap.set(key, {
         business_date: row.business_date,
         pump_id: row.pump_id,
         pump: row.pump,
         team_member: row.user_name,
-        shift: row.shift_name,
+        shift: shiftName,
+        time_in: clockFromTimestamp(row.opened_at),
+        time_out: clockFromTimestamp(row.closed_at),
+        opened_at: row.opened_at,
+        closed_at: row.closed_at,
         ms_price: money(row.ms_price || 0),
         hsd_price: money(row.hsd_price || 0),
         ms_opening: "",
@@ -2586,6 +2674,7 @@ app.get("/reports", requireLogin, async (req, res) => {
   );
   const salesmanRowsRaw = await all(
     `SELECT se.business_date, p.id pump_id, p.name pump, u.name team_member,
+     MIN(se.opened_at) opened_at, MAX(se.closed_at) closed_at,
      MIN(CASE WHEN se.product='MS' THEN se.opening_meter END) ms_opening,
      MAX(CASE WHEN se.product='MS' THEN se.closing_meter END) ms_closing,
      COALESCE(SUM(CASE WHEN se.product='MS' THEN se.litres_sold ELSE 0 END),0) ms_litres,
@@ -2608,7 +2697,11 @@ app.get("/reports", requireLogin, async (req, res) => {
      ORDER BY se.business_date DESC, ${pumpOrderSql("p")}, u.name`,
     params
   );
-  const salesmanRows = salesmanRowsRaw.map((row) => addPriceAdjustmentFields(row, priceByDate, dayClosingByKey));
+  const salesmanRows = salesmanRowsRaw.map((row) => addPriceAdjustmentFields({
+    ...row,
+    time_in: clockFromTimestamp(row.opened_at),
+    time_out: clockFromTimestamp(row.closed_at),
+  }, priceByDate, dayClosingByKey));
   res.send(layout(req, "Reports", `${pageHead("Reports", "Operations > Reports", '<a class="link-button" href="/export/shifts.csv">Export CSV</a>')}
     <section class="form-card"><form method="get" class="grid-form">
       <label class="field"><span>Start</span><input name="start" type="date" value="${esc(start)}"></label>
@@ -2619,8 +2712,8 @@ app.get("/reports", requireLogin, async (req, res) => {
     </form></section>
     <section class="stat-grid"><div class="stat"><span>MS litres</span><strong>${ltr(summary.ms_litres)}</strong></div><div class="stat"><span>HSD litres</span><strong>${ltr(summary.hsd_litres)}</strong></div><div class="stat hero"><span>Sales</span><strong>${rs(summary.sales)}</strong></div><div class="stat"><span>Cash</span><strong>${rs(summary.cash)}</strong></div><div class="stat"><span>Phone Pay</span><strong>${rs(summary.upi)}</strong></div><div class="stat"><span>Credit</span><strong>${rs(summary.credit)}</strong></div><div class="stat"><span>Shortage</span><strong>${rs(summary.shortage)}</strong></div></section>
     ${dayReportTables || '<section class="table-card"><div class="table-card-head"><div><h2>Day Report</h2><p>No day report is available for this date range.</p></div></div><div class="table-wrap"><table><thead><tr><th>Records</th></tr></thead><tbody><tr><td>No records yet.</td></tr></tbody></table></div></section>'}
-    <section class="table-card"><div class="table-card-head"><div><h2>Complete Sales Data</h2><p>Pump-wise MS/HSD readings and sales grouped for the selected dates.</p></div></div>${tableColumns(shifts, ["business_date", "pump", "team_member", "shift", "ms_old_price", "ms_new_price", "ms_opening", "ms_closing", "ms_price_diff_litres", "ms_price_difference", "ms_litres", "hsd_old_price", "hsd_new_price", "hsd_opening", "hsd_closing", "hsd_price_diff_litres", "hsd_price_difference", "hsd_litres", "sales", "cash", "phone_pay", "credit", "beta", "miscellaneous", "expenses", "shortage_excess", "status"])}</section>
-    <section class="table-card"><div class="table-card-head"><div><h2>Salesperson Date Data</h2><p>Daily readings and totals by pump and team member.</p></div></div>${tableColumns(salesmanRows, ["business_date", "pump", "team_member", "ms_old_price", "ms_new_price", "ms_opening", "ms_closing", "ms_price_diff_litres", "ms_price_difference", "ms_litres", "hsd_old_price", "hsd_new_price", "hsd_opening", "hsd_closing", "hsd_price_diff_litres", "hsd_price_difference", "hsd_litres", "sales", "cash", "phone_pay", "credit", "beta", "miscellaneous", "shortage_excess"])}</section>
+    <section class="table-card"><div class="table-card-head"><div><h2>Complete Sales Data</h2><p>Pump-wise MS/HSD readings and sales grouped for the selected dates.</p></div></div>${tableColumns(shifts, ["business_date", "pump", "team_member", "shift", "time_in", "time_out", "ms_old_price", "ms_new_price", "ms_opening", "ms_closing", "ms_before_6_litres", "ms_after_6_litres", "ms_price_difference", "ms_litres", "hsd_old_price", "hsd_new_price", "hsd_opening", "hsd_closing", "hsd_before_6_litres", "hsd_after_6_litres", "hsd_price_difference", "hsd_litres", "sales", "cash", "phone_pay", "credit", "beta", "miscellaneous", "expenses", "shortage_excess", "status"])}</section>
+    <section class="table-card"><div class="table-card-head"><div><h2>Salesperson Date Data</h2><p>Daily readings and totals by pump and team member.</p></div></div>${tableColumns(salesmanRows, ["business_date", "pump", "team_member", "time_in", "time_out", "ms_old_price", "ms_new_price", "ms_opening", "ms_closing", "ms_before_6_litres", "ms_after_6_litres", "ms_price_difference", "ms_litres", "hsd_old_price", "hsd_new_price", "hsd_opening", "hsd_closing", "hsd_before_6_litres", "hsd_after_6_litres", "hsd_price_difference", "hsd_litres", "sales", "cash", "phone_pay", "credit", "beta", "miscellaneous", "shortage_excess"])}</section>
     <section class="table-card"><div class="table-card-head"><div><h2>Payment Log Summary</h2><p>Payments logged during active shifts by pump and type.</p></div></div>${tableColumns(paymentRows, ["business_date", "pump", "team_member", "payment_type", "amount", "entries"])}</section>`));
 });
 
