@@ -397,6 +397,17 @@ function hashWerkzeug(password) {
   return `scrypt:32768:8:1$${salt}$${key.toString("hex")}`;
 }
 
+function adminResetConfig() {
+  const filePath = path.join(BASE_DIR, "tmp", "admin-reset-code.txt");
+  const envCode = String(process.env.ADMIN_RESET_CODE || "").trim();
+  if (envCode) return { code: envCode, source: "environment" };
+  if (fs.existsSync(filePath)) {
+    const fileCode = fs.readFileSync(filePath, "utf8").trim();
+    if (fileCode) return { code: fileCode, source: "file", filePath };
+  }
+  return null;
+}
+
 function dashboardMetrics() {
   const day = activeDay();
   if (!day) return { day: null };
@@ -602,6 +613,61 @@ app.post("/login", (req, res) => {
     return res.redirect("/");
   }
   flash(req, "error", "Invalid username or password.");
+  res.redirect("/login");
+});
+
+function renderAdminReset(req, res, values = {}, message = "", category = "error") {
+  const resetConfig = adminResetConfig();
+  const messageHtml = message ? `<div class="flash ${esc(category)} span-2">${esc(message)}</div>` : "";
+  res.send(
+    layout(
+      req,
+      "Reset Admin Password",
+      `<section class="auth-card"><h1>Reset Admin</h1><p class="muted">Use the temporary reset code from Hostinger to set a new admin password.</p>
+      <form method="post" class="grid-form">
+        ${messageHtml}
+        ${
+          resetConfig
+            ? ""
+            : '<div class="form-error span-2">Reset is not enabled. Set ADMIN_RESET_CODE in Hostinger environment variables, or create tmp/admin-reset-code.txt with a one-time code.</div>'
+        }
+        <label class="field span-2"><span>Admin login ID</span><input name="mobile" value="${esc(fieldValue(values, "mobile", ""))}" required></label>
+        <label class="field span-2"><span>Reset code</span><input name="reset_code" value="${esc(fieldValue(values, "reset_code", ""))}" required></label>
+        <label class="field span-2"><span>New password</span><input name="password" type="password" required></label>
+        <label class="field span-2"><span>Confirm password</span><input name="confirm_password" type="password" required></label>
+        <div class="action-row"><a class="secondary link-button" href="/login">Back to login</a><button class="primary" ${resetConfig ? "" : "disabled"}>Reset Password</button></div>
+      </form></section>`
+    )
+  );
+}
+
+app.get("/reset-admin", (req, res) => {
+  renderAdminReset(req, res);
+});
+
+app.post("/reset-admin", (req, res) => {
+  const resetConfig = adminResetConfig();
+  const mobile = String(req.body.mobile || "").trim();
+  const resetCode = String(req.body.reset_code || "").trim();
+  const password = String(req.body.password || "");
+  const confirmPassword = String(req.body.confirm_password || "");
+  if (!resetConfig) return renderAdminReset(req, res, req.body, "Reset is not enabled on this deployment.");
+  const submittedCode = Buffer.from(resetCode);
+  const expectedCode = Buffer.from(resetConfig.code);
+  if (submittedCode.length !== expectedCode.length || !crypto.timingSafeEqual(submittedCode, expectedCode)) {
+    return renderAdminReset(req, res, req.body, "Invalid reset code.");
+  }
+  if (password.length < 6) return renderAdminReset(req, res, req.body, "Password must be at least 6 characters.");
+  if (password !== confirmPassword) return renderAdminReset(req, res, req.body, "Passwords do not match.");
+  const admin = one("SELECT * FROM users WHERE mobile=? AND role='admin' AND status='Active'", [mobile]);
+  if (!admin) return renderAdminReset(req, res, req.body, "Active admin login ID not found.");
+  run("UPDATE users SET password_hash=? WHERE id=?", [hashWerkzeug(password), admin.id]);
+  if (resetConfig.source === "file") {
+    try {
+      fs.unlinkSync(resetConfig.filePath);
+    } catch (_err) {}
+  }
+  flash(req, "success", "Admin password reset. Login with the new password.");
   res.redirect("/login");
 });
 
