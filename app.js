@@ -4,6 +4,7 @@ const path = require("path");
 const express = require("express");
 const session = require("express-session");
 const initSqlJs = require("sql.js");
+const mysql = require("mysql2/promise");
 
 const BASE_DIR = __dirname;
 const LEGACY_DATABASE = path.join(BASE_DIR, "petrol_station.sqlite3");
@@ -14,12 +15,44 @@ const DEFAULT_DATA_DIR =
 const DATA_DIR = process.env.PETROL_DATA_DIR || DEFAULT_DATA_DIR;
 const DATABASE = process.env.PETROL_DB || path.join(DATA_DIR, "petrol_station.sqlite3");
 const PORT = Number(process.env.PORT || 3000);
+const DB_DIALECT = String(process.env.DB_DIALECT || "sqlite").toLowerCase();
+const MYSQL_CONFIG = {
+  host: process.env.DB_HOST || "127.0.0.1",
+  port: Number(process.env.DB_PORT || 3306),
+  database: process.env.DB_NAME,
+  user: process.env.DB_USER,
+  password: process.env.DB_PASSWORD,
+  waitForConnections: true,
+  connectionLimit: Number(process.env.DB_POOL_LIMIT || 5),
+};
+const MYSQL_MIGRATION_CODE = String(process.env.MYSQL_MIGRATION_CODE || "").trim();
 
 const app = express();
 let db;
+let mysqlPool;
+let dbInitialized = false;
 
 const PRODUCTS = ["MS", "HSD"];
 const DEFAULT_EXPENSE_CATEGORIES = ["Tea", "Cleaning", "Maintenance", "Staff advance", "Miscellaneous"];
+const USING_MYSQL = DB_DIALECT === "mysql";
+const MIGRATION_TABLES = [
+  "station",
+  "users",
+  "tanks",
+  "pumps",
+  "nozzles",
+  "shift_defs",
+  "customers",
+  "days",
+  "tank_readings",
+  "day_nozzle_readings",
+  "day_pump_testing",
+  "shift_entries",
+  "shift_payments",
+  "expenses",
+  "purchases",
+  "credit_ledger",
+];
 
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
@@ -33,7 +66,240 @@ app.use(
   })
 );
 
-function initDb() {
+const MYSQL_SCHEMA = [
+  `CREATE TABLE IF NOT EXISTS station (
+    id INT PRIMARY KEY,
+    station_name VARCHAR(255) NOT NULL,
+    owner_name VARCHAR(255) NOT NULL,
+    address TEXT,
+    location VARCHAR(255),
+    contact VARCHAR(100),
+    pumps_count INT DEFAULT 0,
+    nozzles_per_pump INT DEFAULT 0,
+    default_testing_qty DECIMAL(12,3) DEFAULT 5,
+    beta_enabled TINYINT DEFAULT 1
+  )`,
+  `CREATE TABLE IF NOT EXISTS users (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    name VARCHAR(255) NOT NULL,
+    mobile VARCHAR(100),
+    role VARCHAR(50) NOT NULL,
+    password_hash TEXT NOT NULL,
+    status VARCHAR(50) NOT NULL DEFAULT 'Active',
+    assigned_pumps TEXT,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+  )`,
+  `CREATE TABLE IF NOT EXISTS tanks (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    name VARCHAR(255) NOT NULL,
+    product VARCHAR(20) NOT NULL,
+    capacity DECIMAL(14,3) NOT NULL,
+    opening_dip DECIMAL(14,3) DEFAULT 0,
+    current_stock DECIMAL(14,3) DEFAULT 0,
+    status VARCHAR(50) DEFAULT 'Active'
+  )`,
+  `CREATE TABLE IF NOT EXISTS pumps (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    name VARCHAR(255) NOT NULL,
+    status VARCHAR(50) DEFAULT 'Active'
+  )`,
+  `CREATE TABLE IF NOT EXISTS nozzles (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    pump_id INT NOT NULL,
+    name VARCHAR(255) NOT NULL,
+    product VARCHAR(20) NOT NULL,
+    tank_id INT NOT NULL,
+    status VARCHAR(50) DEFAULT 'Active',
+    INDEX (pump_id),
+    INDEX (tank_id)
+  )`,
+  `CREATE TABLE IF NOT EXISTS shift_defs (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    name VARCHAR(255) NOT NULL,
+    start_time VARCHAR(20) NOT NULL,
+    end_time VARCHAR(20) NOT NULL,
+    description TEXT,
+    status VARCHAR(50) DEFAULT 'Active'
+  )`,
+  `CREATE TABLE IF NOT EXISTS customers (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    name VARCHAR(255) NOT NULL,
+    mobile VARCHAR(100),
+    vehicle_number VARCHAR(100),
+    company_name VARCHAR(255),
+    address TEXT,
+    credit_limit DECIMAL(14,2) DEFAULT 0,
+    balance DECIMAL(14,2) DEFAULT 0,
+    status VARCHAR(50) DEFAULT 'Active'
+  )`,
+  `CREATE TABLE IF NOT EXISTS days (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    business_date VARCHAR(20) NOT NULL UNIQUE,
+    ms_price DECIMAL(12,2) NOT NULL,
+    hsd_price DECIMAL(12,2) NOT NULL,
+    opening_ms DECIMAL(14,3) DEFAULT 0,
+    opening_hsd DECIMAL(14,3) DEFAULT 0,
+    testing_done TINYINT DEFAULT 0,
+    testing_ms_qty DECIMAL(14,3) DEFAULT 0,
+    testing_hsd_qty DECIMAL(14,3) DEFAULT 0,
+    opening_cash DECIMAL(14,2) DEFAULT 0,
+    notes TEXT,
+    status VARCHAR(50) DEFAULT 'Open',
+    actual_ms DECIMAL(14,3),
+    actual_hsd DECIMAL(14,3),
+    actual_cash DECIMAL(14,2) DEFAULT 0,
+    closed_at TIMESTAMP NULL
+  )`,
+  `CREATE TABLE IF NOT EXISTS tank_readings (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    day_id INT NOT NULL,
+    tank_id INT NOT NULL,
+    opening_dip DECIMAL(14,3) DEFAULT 0,
+    closing_dip DECIMAL(14,3),
+    UNIQUE KEY unique_day_tank (day_id, tank_id),
+    INDEX (tank_id)
+  )`,
+  `CREATE TABLE IF NOT EXISTS day_nozzle_readings (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    day_id INT NOT NULL,
+    nozzle_id INT NOT NULL,
+    opening_meter DECIMAL(14,3) NOT NULL DEFAULT 0,
+    closing_meter DECIMAL(14,3),
+    UNIQUE KEY unique_day_nozzle (day_id, nozzle_id),
+    INDEX (nozzle_id)
+  )`,
+  `CREATE TABLE IF NOT EXISTS day_pump_testing (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    day_id INT NOT NULL,
+    pump_id INT NOT NULL,
+    ms_qty DECIMAL(14,3) DEFAULT 0,
+    hsd_qty DECIMAL(14,3) DEFAULT 0,
+    UNIQUE KEY unique_day_pump (day_id, pump_id),
+    INDEX (pump_id)
+  )`,
+  `CREATE TABLE IF NOT EXISTS shift_entries (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    day_id INT NOT NULL,
+    business_date VARCHAR(20) NOT NULL,
+    shift_def_id INT NOT NULL,
+    user_id INT NOT NULL,
+    nozzle_id INT NOT NULL,
+    tank_id INT NOT NULL,
+    product VARCHAR(20) NOT NULL,
+    opening_meter DECIMAL(14,3) NOT NULL,
+    closing_meter DECIMAL(14,3),
+    litres_sold DECIMAL(14,3) DEFAULT 0,
+    rate DECIMAL(12,2) DEFAULT 0,
+    sales_amount DECIMAL(14,2) DEFAULT 0,
+    cash DECIMAL(14,2) DEFAULT 0,
+    upi DECIMAL(14,2) DEFAULT 0,
+    card DECIMAL(14,2) DEFAULT 0,
+    credit DECIMAL(14,2) DEFAULT 0,
+    customer_id INT,
+    expenses DECIMAL(14,2) DEFAULT 0,
+    beta DECIMAL(14,2) DEFAULT 0,
+    miscellaneous DECIMAL(14,2) DEFAULT 0,
+    misc_note TEXT,
+    remarks TEXT,
+    shortage_excess DECIMAL(14,2) DEFAULT 0,
+    testing_qty DECIMAL(14,3) DEFAULT 0,
+    status VARCHAR(50) DEFAULT 'Open',
+    opened_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    closed_at TIMESTAMP NULL,
+    INDEX (day_id),
+    INDEX (user_id),
+    INDEX (nozzle_id),
+    INDEX (tank_id)
+  )`,
+  `CREATE TABLE IF NOT EXISTS shift_payments (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    shift_entry_id INT NOT NULL,
+    cash DECIMAL(14,2) DEFAULT 0,
+    upi DECIMAL(14,2) DEFAULT 0,
+    card DECIMAL(14,2) DEFAULT 0,
+    credit DECIMAL(14,2) DEFAULT 0,
+    customer_id INT,
+    note TEXT,
+    recorded_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    INDEX (shift_entry_id)
+  )`,
+  `CREATE TABLE IF NOT EXISTS expenses (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    business_date VARCHAR(20) NOT NULL,
+    shift_entry_id INT,
+    paid_by INT,
+    category VARCHAR(255) NOT NULL,
+    amount DECIMAL(14,2) NOT NULL,
+    note TEXT,
+    payment_mode VARCHAR(50) DEFAULT 'Cash',
+    approved TINYINT DEFAULT 1
+  )`,
+  `CREATE TABLE IF NOT EXISTS purchases (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    business_date VARCHAR(20) NOT NULL,
+    product VARCHAR(20) NOT NULL,
+    quantity DECIMAL(14,3) NOT NULL,
+    supplier VARCHAR(255),
+    invoice_number VARCHAR(255),
+    rate DECIMAL(12,2) DEFAULT 0,
+    total_amount DECIMAL(14,2) DEFAULT 0,
+    tank_id INT NOT NULL,
+    before_stock DECIMAL(14,3) DEFAULT 0,
+    after_stock DECIMAL(14,3) DEFAULT 0,
+    notes TEXT,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    INDEX (tank_id)
+  )`,
+  `CREATE TABLE IF NOT EXISTS credit_ledger (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    customer_id INT NOT NULL,
+    business_date VARCHAR(20) NOT NULL,
+    entry_type VARCHAR(50) NOT NULL,
+    product VARCHAR(20),
+    litres DECIMAL(14,3) DEFAULT 0,
+    amount DECIMAL(14,2) NOT NULL,
+    vehicle_number VARCHAR(100),
+    pump_nozzle VARCHAR(255),
+    team_member VARCHAR(255),
+    shift_entry_id INT,
+    payment_mode VARCHAR(50),
+    notes TEXT,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    INDEX (customer_id),
+    INDEX (shift_entry_id)
+  )`,
+];
+
+async function initMysqlDb() {
+  for (const sql of MYSQL_SCHEMA) await db.query(sql);
+  for (const sql of [
+    "ALTER TABLE shift_entries ADD COLUMN testing_qty DECIMAL(14,3) DEFAULT 0",
+    "ALTER TABLE days ADD COLUMN testing_ms_qty DECIMAL(14,3) DEFAULT 0",
+    "ALTER TABLE days ADD COLUMN testing_hsd_qty DECIMAL(14,3) DEFAULT 0",
+  ]) {
+    try {
+      await db.query(sql);
+    } catch (_err) {}
+  }
+  await db.query(`
+    INSERT IGNORE INTO day_nozzle_readings(day_id, nozzle_id, opening_meter)
+    SELECT se.day_id, se.nozzle_id, se.opening_meter
+    FROM shift_entries se
+    JOIN (
+      SELECT day_id, nozzle_id, MIN(id) first_entry_id
+      FROM shift_entries
+      GROUP BY day_id, nozzle_id
+    ) firsts ON firsts.first_entry_id=se.id
+  `);
+}
+
+async function initDb() {
+  if (dbInitialized) return;
+  if (USING_MYSQL) {
+    await initMysqlDb();
+    dbInitialized = true;
+    return;
+  }
   db.exec(`
     PRAGMA foreign_keys = ON;
     CREATE TABLE IF NOT EXISTS station (
@@ -245,9 +511,26 @@ function initDb() {
     ) firsts ON firsts.first_entry_id=se.id
   `);
   persistDb();
+  dbInitialized = true;
 }
 
-function all(sql, params = []) {
+function mysqlOrderSql(sql) {
+  return sql
+    .replaceAll(
+      "CASE WHEN name GLOB 'Pump [0-9]*' THEN CAST(SUBSTR(name, 6) AS INTEGER) ELSE 999999 END, name",
+      "CASE WHEN name REGEXP '^Pump [0-9]+' THEN CAST(SUBSTRING(name, 6) AS UNSIGNED) ELSE 999999 END, name"
+    )
+    .replaceAll(
+      "CASE WHEN p.name GLOB 'Pump [0-9]*' THEN CAST(SUBSTR(p.name, 6) AS INTEGER) ELSE 999999 END, p.name",
+      "CASE WHEN p.name REGEXP '^Pump [0-9]+' THEN CAST(SUBSTRING(p.name, 6) AS UNSIGNED) ELSE 999999 END, p.name"
+    );
+}
+
+async function all(sql, params = []) {
+  if (USING_MYSQL) {
+    const [rows] = await db.execute(mysqlOrderSql(sql), params);
+    return rows;
+  }
   const stmt = db.prepare(sql);
   const rows = [];
   try {
@@ -259,24 +542,28 @@ function all(sql, params = []) {
   return rows;
 }
 
-function one(sql, params = []) {
-  return all(sql, params)[0];
+async function one(sql, params = []) {
+  return (await all(sql, params))[0];
 }
 
-function run(sql, params = []) {
+async function run(sql, params = []) {
+  if (USING_MYSQL) {
+    const [info] = await db.execute(mysqlOrderSql(sql), params);
+    return { lastInsertRowid: info.insertId || 0, changes: info.affectedRows || 0 };
+  }
   const stmt = db.prepare(sql);
   try {
     stmt.run(params);
   } finally {
     stmt.free();
   }
-  const info = one("SELECT last_insert_rowid() AS lastInsertRowid, changes() AS changes");
+  const info = await one("SELECT last_insert_rowid() AS lastInsertRowid, changes() AS changes");
   persistDb();
   return info;
 }
 
 function persistDb() {
-  if (!db) return;
+  if (!db || USING_MYSQL) return;
   fs.mkdirSync(path.dirname(DATABASE), { recursive: true });
   fs.writeFileSync(DATABASE, Buffer.from(db.export()));
 }
@@ -338,28 +625,28 @@ function popFlash(req) {
   return messages;
 }
 
-function setupRequired() {
-  return Number(one("SELECT COUNT(*) AS c FROM users").c) === 0;
+async function setupRequired() {
+  return Number((await one("SELECT COUNT(*) AS c FROM users")).c) === 0;
 }
 
-function activeDay() {
-  return one("SELECT * FROM days WHERE status='Open' ORDER BY business_date DESC LIMIT 1");
+async function activeDay() {
+  return await one("SELECT * FROM days WHERE status='Open' ORDER BY business_date DESC LIMIT 1");
 }
 
 function productPrice(day, product) {
   return Number(product === "MS" ? day.ms_price : day.hsd_price);
 }
 
-function lastMeter(nozzleId) {
-  const row = one(
+async function lastMeter(nozzleId) {
+  const row = await one(
     "SELECT closing_meter FROM shift_entries WHERE nozzle_id=? AND closing_meter IS NOT NULL ORDER BY id DESC LIMIT 1",
     [nozzleId]
   );
   return row ? Number(row.closing_meter) : null;
 }
 
-function dayOpeningMeter(dayId, nozzleId) {
-  const row = one("SELECT opening_meter FROM day_nozzle_readings WHERE day_id=? AND nozzle_id=?", [dayId, nozzleId]);
+async function dayOpeningMeter(dayId, nozzleId) {
+  const row = await one("SELECT opening_meter FROM day_nozzle_readings WHERE day_id=? AND nozzle_id=?", [dayId, nozzleId]);
   return row ? Number(row.opening_meter) : null;
 }
 
@@ -371,8 +658,8 @@ function inlineError(message) {
   return message ? `<div class="form-error span-2">${esc(message)}</div>` : "";
 }
 
-function detectShift(timeStr) {
-  const shifts = all("SELECT * FROM shift_defs WHERE status='Active' ORDER BY start_time");
+async function detectShift(timeStr) {
+  const shifts = await all("SELECT * FROM shift_defs WHERE status='Active' ORDER BY start_time");
   if (!shifts.length) return null;
   const now = timeStr || new Date().toTimeString().slice(0, 5);
   for (const shift of shifts) {
@@ -385,13 +672,18 @@ function detectShift(timeStr) {
   return shifts[0];
 }
 
-function getShiftPaymentsTotal(entryId) {
-  return one(
+async function getShiftPaymentsTotal(entryId) {
+  return await one(
     `SELECT COALESCE(SUM(cash),0) cash, COALESCE(SUM(upi),0) upi,
      COALESCE(SUM(card),0) card, COALESCE(SUM(credit),0) credit
      FROM shift_payments WHERE shift_entry_id=?`,
     [entryId]
   );
+}
+
+async function decrementLargestTank(product, quantity) {
+  const tank = await one("SELECT id FROM tanks WHERE product=? AND status='Active' ORDER BY current_stock DESC LIMIT 1", [product]);
+  if (tank) await run("UPDATE tanks SET current_stock=current_stock-? WHERE id=?", [quantity, tank.id]);
 }
 
 function verifyWerkzeug(password, stored) {
@@ -436,12 +728,64 @@ function adminResetConfig() {
   return null;
 }
 
-function ensureConfiguredPumpProducts() {
+function readSqliteRows(sqliteDb, sql, params = []) {
+  const stmt = sqliteDb.prepare(sql);
+  const rows = [];
+  try {
+    stmt.bind(params);
+    while (stmt.step()) rows.push(stmt.getAsObject());
+  } finally {
+    stmt.free();
+  }
+  return rows;
+}
+
+async function migrateSqliteToMysql(sqlitePath) {
+  if (!USING_MYSQL) throw new Error("Migration is only available when DB_DIALECT=mysql.");
+  if (!fs.existsSync(sqlitePath)) throw new Error(`SQLite file was not found at ${sqlitePath}.`);
+  const targetUsers = await one("SELECT COUNT(*) c FROM users");
+  if (Number(targetUsers?.c || 0) > 0) {
+    throw new Error("MySQL already has users, so migration stopped to avoid duplicating or overwriting data.");
+  }
+  const SQL = await initSqlJs();
+  const sqliteDb = new SQL.Database(fs.readFileSync(sqlitePath));
+  const summary = [];
+  await db.query("SET FOREIGN_KEY_CHECKS=0");
+  try {
+    for (const tableName of MIGRATION_TABLES) {
+      const exists = readSqliteRows(sqliteDb, "SELECT name FROM sqlite_master WHERE type='table' AND name=?", [tableName])[0];
+      if (!exists) {
+        summary.push({ table: tableName, rows: 0, skipped: true });
+        continue;
+      }
+      const columns = readSqliteRows(sqliteDb, `PRAGMA table_info(${tableName})`).map((c) => c.name);
+      const rows = readSqliteRows(sqliteDb, `SELECT * FROM ${tableName}`);
+      if (!rows.length) {
+        summary.push({ table: tableName, rows: 0 });
+        continue;
+      }
+      const quotedTable = `\`${tableName}\``;
+      const quotedColumns = columns.map((c) => `\`${c}\``).join(", ");
+      const placeholders = columns.map(() => "?").join(", ");
+      const sql = `INSERT INTO ${quotedTable} (${quotedColumns}) VALUES (${placeholders})`;
+      for (const row of rows) {
+        await db.execute(sql, columns.map((c) => (row[c] === undefined ? null : row[c])));
+      }
+      summary.push({ table: tableName, rows: rows.length });
+    }
+  } finally {
+    sqliteDb.close();
+    await db.query("SET FOREIGN_KEY_CHECKS=1");
+  }
+  return summary;
+}
+
+async function ensureConfiguredPumpProducts() {
   const tankIds = {};
   for (const product of PRODUCTS) {
-    let tank = one("SELECT * FROM tanks WHERE product=? AND status='Active' ORDER BY id LIMIT 1", [product]);
+    let tank = await one("SELECT * FROM tanks WHERE product=? AND status='Active' ORDER BY id LIMIT 1", [product]);
     if (!tank) {
-      const created = run("INSERT INTO tanks(name, product, capacity, opening_dip, current_stock, status) VALUES(?,?,?,?,?,?)", [
+      const created = await run("INSERT INTO tanks(name, product, capacity, opening_dip, current_stock, status) VALUES(?,?,?,?,?,?)", [
         `${product} Tank`,
         product,
         20000,
@@ -449,16 +793,16 @@ function ensureConfiguredPumpProducts() {
         0,
         "Active",
       ]);
-      tank = one("SELECT * FROM tanks WHERE id=?", [created.lastInsertRowid]);
+      tank = await one("SELECT * FROM tanks WHERE id=?", [created.lastInsertRowid]);
     }
     tankIds[product] = tank.id;
   }
-  const pumps = all("SELECT * FROM pumps WHERE status='Active'");
+  const pumps = await all("SELECT * FROM pumps WHERE status='Active'");
   for (const pump of pumps) {
     for (const product of PRODUCTS) {
-      const existing = one("SELECT id FROM nozzles WHERE pump_id=? AND product=? AND status='Active'", [pump.id, product]);
+      const existing = await one("SELECT id FROM nozzles WHERE pump_id=? AND product=? AND status='Active'", [pump.id, product]);
       if (!existing) {
-        run("INSERT INTO nozzles(pump_id, name, product, tank_id, status) VALUES(?,?,?,?,?)", [
+        await run("INSERT INTO nozzles(pump_id, name, product, tank_id, status) VALUES(?,?,?,?,?)", [
           pump.id,
           `${pump.name} ${product}`,
           product,
@@ -504,11 +848,11 @@ function groupPumpEntries(entries) {
   return Array.from(grouped.values());
 }
 
-function activePumpGroups(req) {
+async function activePumpGroups(req) {
   const where = req.user.role === "pump_boy" ? "AND se.user_id=?" : "";
   const params = req.user.role === "pump_boy" ? [req.user.id] : [];
   return groupPumpEntries(
-    all(
+    await all(
       `SELECT se.id, se.business_date, p.id pump_id, p.name pump, se.product, u.name user_name, sd.name shift_name,
        se.opening_meter, se.closing_meter, se.status
        FROM shift_entries se
@@ -523,10 +867,10 @@ function activePumpGroups(req) {
   );
 }
 
-function dashboardMetrics() {
-  const day = activeDay();
+async function dashboardMetrics() {
+  const day = await activeDay();
   if (!day) return { day: null };
-  const totals = one(
+  const totals = await one(
     `SELECT COALESCE(SUM(sales_amount),0) sales, COALESCE(SUM(cash),0) cash,
      COALESCE(SUM(upi),0) upi, COALESCE(SUM(card),0) card, COALESCE(SUM(credit),0) credit,
      COALESCE(SUM(expenses),0) expenses, COALESCE(SUM(beta),0) beta,
@@ -540,32 +884,36 @@ function dashboardMetrics() {
   return {
     day,
     totals,
-    open_shifts: one("SELECT COUNT(*) c FROM shift_entries WHERE day_id=? AND status='Open'", [day.id]).c,
-    tank_stock: all("SELECT product, COALESCE(SUM(current_stock),0) stock FROM tanks GROUP BY product"),
-    credit_pending: one("SELECT COALESCE(SUM(balance),0) b FROM customers WHERE status='Active'").b,
-    top_customers: all("SELECT name, balance FROM customers WHERE balance>0 ORDER BY balance DESC LIMIT 5"),
-    pump_sales: all(
+    open_shifts: (await one("SELECT COUNT(*) c FROM shift_entries WHERE day_id=? AND status='Open'", [day.id])).c,
+    tank_stock: await all("SELECT product, COALESCE(SUM(current_stock),0) stock FROM tanks GROUP BY product"),
+    credit_pending: (await one("SELECT COALESCE(SUM(balance),0) b FROM customers WHERE status='Active'")).b,
+    top_customers: await all("SELECT name, balance FROM customers WHERE balance>0 ORDER BY balance DESC LIMIT 5"),
+    pump_sales: await all(
       `SELECT p.name pump, COALESCE(SUM(se.sales_amount),0) sales, COALESCE(SUM(se.litres_sold),0) litres
        FROM pumps p
        LEFT JOIN nozzles n ON n.pump_id=p.id
        LEFT JOIN shift_entries se ON se.nozzle_id=n.id AND se.day_id=? AND se.status='Closed'
-       GROUP BY p.id ORDER BY p.name`,
+       GROUP BY p.id, p.name ORDER BY p.name`,
       [day.id]
     ),
-    boy_sales: all(
+    boy_sales: await all(
       `SELECT u.name, COALESCE(SUM(se.sales_amount),0) sales, COALESCE(SUM(se.litres_sold),0) litres
        FROM users u JOIN shift_entries se ON se.user_id=u.id
        WHERE se.day_id=? AND se.status='Closed'
-       GROUP BY u.id ORDER BY sales DESC`,
+       GROUP BY u.id, u.name ORDER BY sales DESC`,
       [day.id]
     ),
   };
 }
 
-function requireLogin(req, res, next) {
-  if (setupRequired() && req.path !== "/setup") return res.redirect("/setup");
-  if (!req.user) return res.redirect("/login");
-  next();
+async function requireLogin(req, res, next) {
+  try {
+    if ((await setupRequired()) && req.path !== "/setup") return res.redirect("/setup");
+    if (!req.user) return res.redirect("/login");
+    next();
+  } catch (err) {
+    next(err);
+  }
 }
 
 function requireRoles(...roles) {
@@ -576,13 +924,17 @@ function requireRoles(...roles) {
   };
 }
 
-app.use((req, _res, next) => {
-  initDb();
-  req.station = one("SELECT * FROM station WHERE id=1");
-  req.user = req.session.userId
-    ? one("SELECT * FROM users WHERE id=? AND status='Active'", [req.session.userId])
-    : null;
-  next();
+app.use(async (req, _res, next) => {
+  try {
+    await initDb();
+    req.station = await one("SELECT * FROM station WHERE id=1");
+    req.user = req.session.userId
+      ? await one("SELECT * FROM users WHERE id=? AND status='Active'", [req.session.userId])
+      : null;
+    next();
+  } catch (err) {
+    next(err);
+  }
 });
 
 function layout(req, title, content) {
@@ -654,8 +1006,8 @@ function pageHead(title, crumb = "", action = "") {
   return `<section class="page-head"><div><small>${esc(crumb)}</small><h1>${esc(title)}</h1></div>${action}</section>`;
 }
 
-app.get("/setup", (req, res) => {
-  if (!setupRequired()) return res.redirect("/");
+app.get("/setup", async (req, res) => {
+  if (!(await setupRequired())) return res.redirect("/");
   res.send(
     layout(
       req,
@@ -675,13 +1027,13 @@ app.get("/setup", (req, res) => {
   );
 });
 
-app.post("/setup", (req, res) => {
-  if (!setupRequired()) return res.redirect("/");
+app.post("/setup", async (req, res) => {
+  if (!(await setupRequired())) return res.redirect("/");
   if (!req.body.station_name || !req.body.owner_name || String(req.body.password || "").length < 6) {
     flash(req, "error", "Station, owner, and a password of at least 6 characters are required.");
     return res.redirect("/setup");
   }
-  run(
+  await run(
     `INSERT INTO station(id, station_name, owner_name, address, location, contact, default_testing_qty)
      VALUES(1,?,?,?,?,?,?)`,
     [
@@ -693,7 +1045,7 @@ app.post("/setup", (req, res) => {
       Number(req.body.default_testing_qty || 5),
     ]
   );
-  const user = run("INSERT INTO users(name, mobile, role, password_hash) VALUES(?,?,?,?)", [
+  const user = await run("INSERT INTO users(name, mobile, role, password_hash) VALUES(?,?,?,?)", [
     req.body.owner_name,
     req.body.contact || "",
     "admin",
@@ -704,8 +1056,8 @@ app.post("/setup", (req, res) => {
   res.redirect("/");
 });
 
-app.get("/login", (req, res) => {
-  if (setupRequired()) return res.redirect("/setup");
+app.get("/login", async (req, res) => {
+  if (await setupRequired()) return res.redirect("/setup");
   res.send(
     layout(
       req,
@@ -720,8 +1072,8 @@ app.get("/login", (req, res) => {
   );
 });
 
-app.post("/login", (req, res) => {
-  const user = one("SELECT * FROM users WHERE mobile=? AND status='Active'", [String(req.body.mobile || "").trim()]);
+app.post("/login", async (req, res) => {
+  const user = await one("SELECT * FROM users WHERE mobile=? AND status='Active'", [String(req.body.mobile || "").trim()]);
   if (user && verifyWerkzeug(req.body.password || "", user.password_hash)) {
     req.session.userId = user.id;
     return res.redirect("/");
@@ -755,11 +1107,11 @@ function renderAdminReset(req, res, values = {}, message = "", category = "error
   );
 }
 
-app.get("/reset-admin", (req, res) => {
+app.get("/reset-admin", async (req, res) => {
   renderAdminReset(req, res);
 });
 
-app.post("/reset-admin", (req, res) => {
+app.post("/reset-admin", async (req, res) => {
   const resetConfig = adminResetConfig();
   const mobile = String(req.body.mobile || "").trim();
   const resetCode = String(req.body.reset_code || "").trim();
@@ -773,20 +1125,20 @@ app.post("/reset-admin", (req, res) => {
   }
   if (password.length < 6) return renderAdminReset(req, res, req.body, "Password must be at least 6 characters.");
   if (password !== confirmPassword) return renderAdminReset(req, res, req.body, "Passwords do not match.");
-  let admin = mobile ? one("SELECT * FROM users WHERE mobile=? AND role='admin' AND status='Active'", [mobile]) : null;
-  if (!admin) admin = one("SELECT * FROM users WHERE role='admin' AND status='Active' ORDER BY id LIMIT 1");
+  let admin = mobile ? await one("SELECT * FROM users WHERE mobile=? AND role='admin' AND status='Active'", [mobile]) : null;
+  if (!admin) admin = await one("SELECT * FROM users WHERE role='admin' AND status='Active' ORDER BY id LIMIT 1");
   if (!admin && mobile) {
-    const created = run("INSERT INTO users(name, mobile, role, password_hash, status) VALUES(?,?,?,?,?)", [
+    const created = await run("INSERT INTO users(name, mobile, role, password_hash, status) VALUES(?,?,?,?,?)", [
       "Emergency Admin",
       mobile,
       "admin",
       hashWerkzeug(password),
       "Active",
     ]);
-    admin = one("SELECT * FROM users WHERE id=?", [created.lastInsertRowid]);
+    admin = await one("SELECT * FROM users WHERE id=?", [created.lastInsertRowid]);
   }
   if (!admin) return renderAdminReset(req, res, req.body, "No active admin was found. Enter the login ID you want to create, then submit again.");
-  run("UPDATE users SET password_hash=? WHERE id=?", [hashWerkzeug(password), admin.id]);
+  await run("UPDATE users SET password_hash=? WHERE id=?", [hashWerkzeug(password), admin.id]);
   if (resetConfig.source === "file") {
     try {
       fs.unlinkSync(resetConfig.filePath);
@@ -796,12 +1148,49 @@ app.post("/reset-admin", (req, res) => {
   res.redirect("/login");
 });
 
-app.get("/logout", (req, res) => {
+app.get("/admin/mysql-migrate", async (req, res) => {
+  if (!USING_MYSQL || !MYSQL_MIGRATION_CODE) return res.status(404).send("Not found");
+  res.send(
+    `<!doctype html><html><head><meta charset="utf-8"><title>MySQL Migration</title><link rel="stylesheet" href="/static/app.css"></head><body>
+    <main class="auth-shell"><section class="auth-card"><h1>Move SQLite Data to MySQL</h1>
+    <p class="muted">This copies the old live SQLite database into empty MySQL tables. It will stop if MySQL already has users.</p>
+    <form method="post" class="grid-form">
+      <label class="field span-2"><span>Migration code</span><input name="migration_code" required></label>
+      <label class="field span-2"><span>SQLite path</span><input name="sqlite_path" value="${esc(process.env.PETROL_SQLITE_IMPORT || DATABASE)}"></label>
+      <div class="action-row"><button class="primary">Copy Data</button></div>
+    </form></section></main></body></html>`
+  );
+});
+
+app.post("/admin/mysql-migrate", async (req, res) => {
+  if (!USING_MYSQL || !MYSQL_MIGRATION_CODE) return res.status(404).send("Not found");
+  const submitted = String(req.body.migration_code || "").trim();
+  const a = Buffer.from(submitted);
+  const b = Buffer.from(MYSQL_MIGRATION_CODE);
+  if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return res.status(403).send("Invalid migration code.");
+  try {
+    const sqlitePath = String(req.body.sqlite_path || process.env.PETROL_SQLITE_IMPORT || DATABASE).trim();
+    const summary = await migrateSqliteToMysql(sqlitePath);
+    res.send(
+      `<!doctype html><html><head><meta charset="utf-8"><title>Migration Complete</title><link rel="stylesheet" href="/static/app.css"></head><body>
+      <main class="auth-shell"><section class="auth-card"><h1>Migration Complete</h1>
+      ${table(summary)}<div class="action-row"><a class="primary link-button" href="/login">Go to login</a></div></section></main></body></html>`
+    );
+  } catch (err) {
+    res.status(400).send(
+      `<!doctype html><html><head><meta charset="utf-8"><title>Migration Stopped</title><link rel="stylesheet" href="/static/app.css"></head><body>
+      <main class="auth-shell"><section class="auth-card"><h1>Migration Stopped</h1>
+      <div class="flash error">${esc(err.message)}</div><div class="action-row"><a class="secondary link-button" href="/admin/mysql-migrate">Back</a></div></section></main></body></html>`
+    );
+  }
+});
+
+app.get("/logout", async (req, res) => {
   req.session.destroy(() => res.redirect("/login"));
 });
 
-app.get("/", requireLogin, (req, res) => {
-  const metrics = dashboardMetrics();
+app.get("/", requireLogin, async (req, res) => {
+  const metrics = await dashboardMetrics();
   if (!metrics.day) {
     return res.send(
       layout(
@@ -813,8 +1202,8 @@ app.get("/", requireLogin, (req, res) => {
     );
   }
   const m = metrics;
-  const openingRows = dayOpeningRows(m.day.id);
-  const openEntries = all(
+  const openingRows = await dayOpeningRows(m.day.id);
+  const openEntries = await all(
     `SELECT se.business_date, p.name pump, se.product, u.name user_name, se.opening_meter, se.status
      FROM shift_entries se
      JOIN users u ON u.id=se.user_id
@@ -856,9 +1245,9 @@ app.get("/", requireLogin, (req, res) => {
 });
 
 app.route("/station")
-  .get(requireLogin, requireRoles("admin"), (req, res) => {
+  .get(requireLogin, requireRoles("admin"), async (req, res) => {
     const s = req.station || {};
-    const defaultPumpCount = s.pumps_count || one("SELECT COUNT(*) c FROM pumps WHERE status='Active'").c || 2;
+    const defaultPumpCount = s.pumps_count || (await one("SELECT COUNT(*) c FROM pumps WHERE status='Active'")).c || 2;
     res.send(
       layout(req, "Station", `${pageHead("Station Settings", "Setup > Station")}
       <section class="form-card"><form method="post" class="grid-form">
@@ -871,8 +1260,8 @@ app.route("/station")
       </form></section>`)
     );
   })
-  .post(requireLogin, requireRoles("admin"), (req, res) => {
-    run(
+  .post(requireLogin, requireRoles("admin"), async (req, res) => {
+    await run(
       `UPDATE station SET station_name=?, owner_name=?, address=?, location=?, contact=?, pumps_count=?,
        nozzles_per_pump=?, default_testing_qty=?, beta_enabled=? WHERE id=1`,
       [
@@ -891,9 +1280,9 @@ app.route("/station")
     res.redirect("/station");
   });
 
-function masterForm(kind, rows) {
-  const tanks = all("SELECT * FROM tanks WHERE status='Active'");
-  const pumps = all("SELECT * FROM pumps WHERE status='Active'");
+async function masterForm(kind, rows) {
+  const tanks = await all("SELECT * FROM tanks WHERE status='Active'");
+  const pumps = await all("SELECT * FROM pumps WHERE status='Active'");
   let fields = "";
   if (kind === "tanks") {
     fields = `<label class="field"><span>Tank name</span><input name="name" required></label>
@@ -930,7 +1319,7 @@ function masterForm(kind, rows) {
   return `<section class="form-card"><div class="form-card-head"><div><h2>Add ${esc(kind)}</h2><p>Fill the required fields and save. Existing records stay visible below.</p></div></div><form method="post" class="grid-form">${fields}<div class="action-row"><button class="primary">Save</button></div></form></section><section class="table-card">${table(rows)}</section>`;
 }
 
-app.get("/master/:kind", requireLogin, requireRoles("admin", "manager"), (req, res) => {
+app.get("/master/:kind", requireLogin, requireRoles("admin", "manager"), async (req, res) => {
   const kind = req.params.kind;
   if (kind === "nozzles") return res.redirect("/master/pumps");
   const queries = {
@@ -941,20 +1330,20 @@ app.get("/master/:kind", requireLogin, requireRoles("admin", "manager"), (req, r
     customers: "SELECT * FROM customers ORDER BY name",
   };
   if (!queries[kind]) return res.status(404).send("Not found");
-  let rows = all(queries[kind]);
+  let rows = await all(queries[kind]);
   if (kind === "team") rows = rows.map((r) => ({ ...r, actions: `<a class="link-button secondary" href="/master/team/${esc(r.id)}/edit">Edit</a>` }));
-  res.send(layout(req, `Master ${kind}`, `${pageHead(`Add New ${kind}`, `Setup > ${kind}`)}${masterForm(kind, rows)}`));
+  res.send(layout(req, `Master ${kind}`, `${pageHead(`Add New ${kind}`, `Setup > ${kind}`)}${await masterForm(kind, rows)}`));
 });
 
-app.post("/master/:kind", requireLogin, requireRoles("admin", "manager"), (req, res) => {
+app.post("/master/:kind", requireLogin, requireRoles("admin", "manager"), async (req, res) => {
   const b = req.body;
   const kind = req.params.kind;
   if (kind === "nozzles") return res.redirect("/master/pumps");
-  if (kind === "tanks") run("INSERT INTO tanks(name, product, capacity, opening_dip, current_stock, status) VALUES(?,?,?,?,?,?)", [b.name, b.product, Number(b.capacity), Number(b.opening_dip || 0), Number(b.current_stock || 0), b.status || "Active"]);
-  else if (kind === "pumps") run("INSERT INTO pumps(name, status) VALUES(?,?)", [b.name, b.status || "Active"]);
-  else if (kind === "team") run("INSERT INTO users(name, mobile, role, password_hash, status, assigned_pumps) VALUES(?,?,?,?,?,?)", [b.name, b.mobile, b.role, hashWerkzeug(b.password), b.status || "Active", b.assigned_pumps || ""]);
-  else if (kind === "shifts") run("INSERT INTO shift_defs(name, start_time, end_time, description, status) VALUES(?,?,?,?,?)", [b.name, b.start_time, b.end_time, b.description || "", b.status || "Active"]);
-  else if (kind === "customers") run("INSERT INTO customers(name, mobile, vehicle_number, company_name, address, credit_limit, balance, status) VALUES(?,?,?,?,?,?,?,?)", [b.name, b.mobile || "", b.vehicle_number || "", b.company_name || "", b.address || "", Number(b.credit_limit || 0), Number(b.opening_balance || 0), b.status || "Active"]);
+  if (kind === "tanks") await run("INSERT INTO tanks(name, product, capacity, opening_dip, current_stock, status) VALUES(?,?,?,?,?,?)", [b.name, b.product, Number(b.capacity), Number(b.opening_dip || 0), Number(b.current_stock || 0), b.status || "Active"]);
+  else if (kind === "pumps") await run("INSERT INTO pumps(name, status) VALUES(?,?)", [b.name, b.status || "Active"]);
+  else if (kind === "team") await run("INSERT INTO users(name, mobile, role, password_hash, status, assigned_pumps) VALUES(?,?,?,?,?,?)", [b.name, b.mobile, b.role, hashWerkzeug(b.password), b.status || "Active", b.assigned_pumps || ""]);
+  else if (kind === "shifts") await run("INSERT INTO shift_defs(name, start_time, end_time, description, status) VALUES(?,?,?,?,?)", [b.name, b.start_time, b.end_time, b.description || "", b.status || "Active"]);
+  else if (kind === "customers") await run("INSERT INTO customers(name, mobile, vehicle_number, company_name, address, credit_limit, balance, status) VALUES(?,?,?,?,?,?,?,?)", [b.name, b.mobile || "", b.vehicle_number || "", b.company_name || "", b.address || "", Number(b.credit_limit || 0), Number(b.opening_balance || 0), b.status || "Active"]);
   else return res.status(404).send("Not found");
   flash(req, "success", "Record saved.");
   res.redirect(`/master/${kind}`);
@@ -975,19 +1364,19 @@ function renderTeamEdit(req, res, user, values = {}, error = "") {
     </form></section>`));
 }
 
-app.get("/master/team/:id/edit", requireLogin, requireRoles("admin", "manager"), (req, res) => {
-  const user = one("SELECT id, name, mobile, role, status, assigned_pumps FROM users WHERE id=?", [Number(req.params.id)]);
+app.get("/master/team/:id/edit", requireLogin, requireRoles("admin", "manager"), async (req, res) => {
+  const user = await one("SELECT id, name, mobile, role, status, assigned_pumps FROM users WHERE id=?", [Number(req.params.id)]);
   if (!user) return res.redirect("/master/team");
   renderTeamEdit(req, res, user);
 });
 
-app.post("/master/team/:id/edit", requireLogin, requireRoles("admin", "manager"), (req, res) => {
-  const user = one("SELECT id, name, mobile, role, status, assigned_pumps FROM users WHERE id=?", [Number(req.params.id)]);
+app.post("/master/team/:id/edit", requireLogin, requireRoles("admin", "manager"), async (req, res) => {
+  const user = await one("SELECT id, name, mobile, role, status, assigned_pumps FROM users WHERE id=?", [Number(req.params.id)]);
   if (!user) return res.redirect("/master/team");
   const b = req.body;
   if (!b.name || !b.mobile) return renderTeamEdit(req, res, user, b, "Name and login ID are required.");
   if (String(b.password || "").trim()) {
-    run("UPDATE users SET name=?, mobile=?, role=?, password_hash=?, status=?, assigned_pumps=? WHERE id=?", [
+    await run("UPDATE users SET name=?, mobile=?, role=?, password_hash=?, status=?, assigned_pumps=? WHERE id=?", [
       b.name,
       b.mobile,
       b.role,
@@ -997,7 +1386,7 @@ app.post("/master/team/:id/edit", requireLogin, requireRoles("admin", "manager")
       user.id,
     ]);
   } else {
-    run("UPDATE users SET name=?, mobile=?, role=?, status=?, assigned_pumps=? WHERE id=?", [
+    await run("UPDATE users SET name=?, mobile=?, role=?, status=?, assigned_pumps=? WHERE id=?", [
       b.name,
       b.mobile,
       b.role,
@@ -1010,8 +1399,8 @@ app.post("/master/team/:id/edit", requireLogin, requireRoles("admin", "manager")
   res.redirect("/master/team");
 });
 
-function dayOpeningRows(dayId) {
-  const rows = all(
+async function dayOpeningRows(dayId) {
+  const rows = await all(
     `SELECT d.business_date, p.id pump_id, p.name pump, n.product, dnr.opening_meter
      FROM day_nozzle_readings dnr
      JOIN days d ON d.id=dnr.day_id
@@ -1031,24 +1420,24 @@ function dayOpeningRows(dayId) {
   return Array.from(grouped.values());
 }
 
-function renderDayStart(req, res, values = {}, error = "") {
-  ensureConfiguredPumpProducts();
-  const tanks = all("SELECT * FROM tanks WHERE status='Active' ORDER BY product, name");
-  const nozzles = all(
+async function renderDayStart(req, res, values = {}, error = "") {
+  await ensureConfiguredPumpProducts();
+  const tanks = await all("SELECT * FROM tanks WHERE status='Active' ORDER BY product, name");
+  const nozzles = await all(
     `SELECT n.*, p.name pump
      FROM nozzles n JOIN pumps p ON p.id=n.pump_id
      WHERE n.status='Active' AND p.status='Active'
      ORDER BY CASE WHEN p.name GLOB 'Pump [0-9]*' THEN CAST(SUBSTR(p.name, 6) AS INTEGER) ELSE 999999 END, p.name, n.product, n.name`
   );
-  const pumps = all(
+  const pumps = await all(
     `SELECT DISTINCT p.id, p.name
      FROM pumps p JOIN nozzles n ON n.pump_id=p.id
      WHERE p.status='Active' AND n.status='Active'
      ORDER BY CASE WHEN p.name GLOB 'Pump [0-9]*' THEN CAST(SUBSTR(p.name, 6) AS INTEGER) ELSE 999999 END, p.name`
   );
-  const currentDay = activeDay();
-  const currentRows = currentDay ? dayOpeningRows(currentDay.id) : [];
-  const recentDays = all("SELECT id, business_date, ms_price, hsd_price, opening_cash, status FROM days ORDER BY business_date DESC LIMIT 10");
+  const currentDay = await activeDay();
+  const currentRows = currentDay ? await dayOpeningRows(currentDay.id) : [];
+  const recentDays = await all("SELECT id, business_date, ms_price, hsd_price, opening_cash, status FROM days ORDER BY business_date DESC LIMIT 10");
   res.send(layout(req, "Day Start", `${pageHead("Start Business Day", "Operations > Day Start")}
     <section class="form-card"><form method="post" class="grid-form">
       ${inlineError(error)}
@@ -1081,28 +1470,28 @@ function renderDayStart(req, res, values = {}, error = "") {
 }
 
 app.route("/day/start")
-  .get(requireLogin, requireRoles("admin", "manager"), (req, res) => {
-    renderDayStart(req, res);
+  .get(requireLogin, requireRoles("admin", "manager"), async (req, res) => {
+    await renderDayStart(req, res);
   })
-  .post(requireLogin, requireRoles("admin", "manager"), (req, res) => {
+  .post(requireLogin, requireRoles("admin", "manager"), async (req, res) => {
     const b = req.body;
-    if (one("SELECT id FROM days WHERE business_date=?", [b.business_date])) {
-      return renderDayStart(req, res, b, "A day is already started for this date.");
+    if (await one("SELECT id FROM days WHERE business_date=?", [b.business_date])) {
+      return await renderDayStart(req, res, b, "A day is already started for this date.");
     }
-    const nozzles = all(
+    const nozzles = await all(
       `SELECT n.*, p.name pump
        FROM nozzles n JOIN pumps p ON p.id=n.pump_id
        WHERE n.status='Active' AND p.status='Active'
        ORDER BY CASE WHEN p.name GLOB 'Pump [0-9]*' THEN CAST(SUBSTR(p.name, 6) AS INTEGER) ELSE 999999 END, p.name, n.product, n.name`
     );
-    if (!nozzles.length) return renderDayStart(req, res, b, "Add active pumps before starting the day.");
+    if (!nozzles.length) return await renderDayStart(req, res, b, "Add active pumps before starting the day.");
     for (const nozzle of nozzles) {
       const value = b[`meter_${nozzle.id}_opening`] ?? b[`nozzle_${nozzle.id}_opening`];
       if (value === "" || value == null || Number.isNaN(Number(value))) {
-        return renderDayStart(req, res, b, `Enter opening meter for ${nozzle.pump} ${nozzle.product}.`);
+        return await renderDayStart(req, res, b, `Enter opening meter for ${nozzle.pump} ${nozzle.product}.`);
       }
     }
-    const pumps = all(
+    const pumps = await all(
       `SELECT DISTINCT p.id, p.name
        FROM pumps p JOIN nozzles n ON n.pump_id=p.id
        WHERE p.status='Active' AND n.status='Active'
@@ -1116,62 +1505,61 @@ app.route("/day/start")
     const totalTestingMs = pumpTesting.reduce((a, p) => a + p.ms_qty, 0);
     const totalTestingHsd = pumpTesting.reduce((a, p) => a + p.hsd_qty, 0);
     const testingDone = totalTestingMs > 0 || totalTestingHsd > 0 ? 1 : 0;
-    const openingMs = all("SELECT current_stock FROM tanks WHERE product='MS' AND status='Active'").reduce((a, t) => a + Number(t.current_stock || 0), 0);
-    const openingHsd = all("SELECT current_stock FROM tanks WHERE product='HSD' AND status='Active'").reduce((a, t) => a + Number(t.current_stock || 0), 0);
-    const result = run(
+    const openingMs = (await all("SELECT current_stock FROM tanks WHERE product='MS' AND status='Active'")).reduce((a, t) => a + Number(t.current_stock || 0), 0);
+    const openingHsd = (await all("SELECT current_stock FROM tanks WHERE product='HSD' AND status='Active'")).reduce((a, t) => a + Number(t.current_stock || 0), 0);
+    const result = await run(
       `INSERT INTO days(business_date, ms_price, hsd_price, opening_ms, opening_hsd, testing_done, testing_ms_qty, testing_hsd_qty, opening_cash, notes)
        VALUES(?,?,?,?,?,?,?,?,?,?)`,
       [b.business_date, Number(b.ms_price), Number(b.hsd_price), openingMs, openingHsd, testingDone, totalTestingMs, totalTestingHsd, Number(b.opening_cash || 0), b.notes || ""]
     );
-    for (const tank of all("SELECT * FROM tanks WHERE status='Active'")) {
+    for (const tank of await all("SELECT * FROM tanks WHERE status='Active'")) {
       const opening = Number(tank.current_stock || 0);
-      run("INSERT INTO tank_readings(day_id, tank_id, opening_dip) VALUES(?,?,?)", [result.lastInsertRowid, tank.id, opening]);
-      run("UPDATE tanks SET opening_dip=? WHERE id=?", [opening, tank.id]);
+      await run("INSERT INTO tank_readings(day_id, tank_id, opening_dip) VALUES(?,?,?)", [result.lastInsertRowid, tank.id, opening]);
+      await run("UPDATE tanks SET opening_dip=? WHERE id=?", [opening, tank.id]);
     }
     for (const nozzle of nozzles) {
-      run("INSERT INTO day_nozzle_readings(day_id, nozzle_id, opening_meter) VALUES(?,?,?)", [result.lastInsertRowid, nozzle.id, Number(b[`meter_${nozzle.id}_opening`] ?? b[`nozzle_${nozzle.id}_opening`])]);
+      await run("INSERT INTO day_nozzle_readings(day_id, nozzle_id, opening_meter) VALUES(?,?,?)", [result.lastInsertRowid, nozzle.id, Number(b[`meter_${nozzle.id}_opening`] ?? b[`nozzle_${nozzle.id}_opening`])]);
     }
     for (const p of pumpTesting) {
-      if (p.ms_qty || p.hsd_qty) run("INSERT INTO day_pump_testing(day_id, pump_id, ms_qty, hsd_qty) VALUES(?,?,?,?)", [result.lastInsertRowid, p.pump_id, p.ms_qty, p.hsd_qty]);
+      if (p.ms_qty || p.hsd_qty) await run("INSERT INTO day_pump_testing(day_id, pump_id, ms_qty, hsd_qty) VALUES(?,?,?,?)", [result.lastInsertRowid, p.pump_id, p.ms_qty, p.hsd_qty]);
     }
-    if (testingDone && totalTestingMs > 0) run("UPDATE tanks SET current_stock=current_stock-? WHERE id=(SELECT id FROM tanks WHERE product='MS' AND status='Active' ORDER BY current_stock DESC LIMIT 1)", [totalTestingMs]);
-    if (testingDone && totalTestingHsd > 0) run("UPDATE tanks SET current_stock=current_stock-? WHERE id=(SELECT id FROM tanks WHERE product='HSD' AND status='Active' ORDER BY current_stock DESC LIMIT 1)", [totalTestingHsd]);
+    if (testingDone && totalTestingMs > 0) await decrementLargestTank("MS", totalTestingMs);
+    if (testingDone && totalTestingHsd > 0) await decrementLargestTank("HSD", totalTestingHsd);
     flash(req, "success", "Day started. Shift entries are now available.");
     res.redirect("/day/start");
   });
 
-function renderShiftStart(req, res, values = {}, error = "") {
-  ensureConfiguredPumpProducts();
-  const day = activeDay();
+async function renderShiftStart(req, res, values = {}, error = "") {
+  await ensureConfiguredPumpProducts();
+  const day = await activeDay();
   if (!day) {
     flash(req, "error", "Start a business day before opening shifts.");
     return res.redirect("/day/start");
   }
-  const pumps = all("SELECT * FROM pumps WHERE status='Active' ORDER BY CASE WHEN name GLOB 'Pump [0-9]*' THEN CAST(SUBSTR(name, 6) AS INTEGER) ELSE 999999 END, name");
-  const users = all("SELECT * FROM users WHERE status='Active' AND role IN ('manager','pump_boy') ORDER BY name");
-  const shifts = all("SELECT * FROM shift_defs WHERE status='Active' ORDER BY start_time");
-  const activePumpIds = new Set(
-    all(
-      `SELECT DISTINCT p.id
-       FROM shift_entries se JOIN nozzles n ON n.id=se.nozzle_id JOIN pumps p ON p.id=n.pump_id
-       WHERE se.status='Open'`
-    ).map((r) => Number(r.id))
+  const pumps = await all("SELECT * FROM pumps WHERE status='Active' ORDER BY CASE WHEN name GLOB 'Pump [0-9]*' THEN CAST(SUBSTR(name, 6) AS INTEGER) ELSE 999999 END, name");
+  const users = await all("SELECT * FROM users WHERE status='Active' AND role IN ('manager','pump_boy') ORDER BY name");
+  const shifts = await all("SELECT * FROM shift_defs WHERE status='Active' ORDER BY start_time");
+  const activePumpRows = await all(
+    `SELECT DISTINCT p.id
+     FROM shift_entries se JOIN nozzles n ON n.id=se.nozzle_id JOIN pumps p ON p.id=n.pump_id
+     WHERE se.status='Open'`
   );
-  const activeUserIds = new Set(all("SELECT DISTINCT user_id id FROM shift_entries WHERE status='Open'").map((r) => Number(r.id)));
+  const activePumpIds = new Set(activePumpRows.map((r) => Number(r.id)));
+  const activeUserIds = new Set((await all("SELECT DISTINCT user_id id FROM shift_entries WHERE status='Open'")).map((r) => Number(r.id)));
   const firstAvailablePump = pumps.find((p) => !activePumpIds.has(Number(p.id))) || pumps[0];
   const firstAvailableUser = users.find((u) => !activeUserIds.has(Number(u.id))) || users[0];
   const hasAvailablePump = pumps.some((p) => !activePumpIds.has(Number(p.id)));
   const hasAvailableUser = users.some((u) => !activeUserIds.has(Number(u.id)));
   const selectedPumpId = Number(fieldValue(values, "pump_id", req.query.pump_id || firstAvailablePump?.id || ""));
   const selectedUserId = Number(fieldValue(values, "user_id", firstAvailableUser?.id || req.user.id || ""));
-  const nozzles = all(
+  const nozzles = await all(
     `SELECT n.*, p.name pump
      FROM nozzles n JOIN pumps p ON p.id=n.pump_id
      WHERE n.status='Active' AND p.status='Active' AND p.id=?
      ORDER BY n.product, n.name`,
     [selectedPumpId]
   );
-  const openEntries = activePumpGroups(req).filter((r) => r.business_date === day.business_date);
+  const openEntries = (await activePumpGroups(req)).filter((r) => r.business_date === day.business_date);
   res.send(layout(req, "Start Shift", `${pageHead("Start Shift", "Operations > Start Shift")}
     <section class="form-card"><form method="post" class="grid-form">
       ${inlineError(error)}
@@ -1192,25 +1580,25 @@ function renderShiftStart(req, res, values = {}, error = "") {
 }
 
 app.route("/shift/start")
-  .get(requireLogin, (req, res) => {
-    renderShiftStart(req, res);
+  .get(requireLogin, async (req, res) => {
+    await renderShiftStart(req, res);
   })
-  .post(requireLogin, (req, res) => {
-    const day = activeDay();
+  .post(requireLogin, async (req, res) => {
+    const day = await activeDay();
     if (!day) return res.redirect("/day/start");
     const pumpId = Number(req.body.pump_id);
     const userId = req.user.role === "pump_boy" ? req.user.id : Number(req.body.user_id || req.user.id);
-    const shift = req.body.shift_def_id ? one("SELECT * FROM shift_defs WHERE id=? AND status='Active'", [Number(req.body.shift_def_id)]) : detectShift(req.body.time_in);
-    if (!pumpId || !one("SELECT id FROM pumps WHERE id=? AND status='Active'", [pumpId])) {
-      return renderShiftStart(req, res, req.body, "Select an active pump.");
+    const shift = req.body.shift_def_id ? await one("SELECT * FROM shift_defs WHERE id=? AND status='Active'", [Number(req.body.shift_def_id)]) : await detectShift(req.body.time_in);
+    if (!pumpId || !await one("SELECT id FROM pumps WHERE id=? AND status='Active'", [pumpId])) {
+      return await renderShiftStart(req, res, req.body, "Select an active pump.");
     }
-    if (!userId || !one("SELECT id FROM users WHERE id=? AND status='Active'", [userId])) {
-      return renderShiftStart(req, res, req.body, "Select an active team member.");
+    if (!userId || !await one("SELECT id FROM users WHERE id=? AND status='Active'", [userId])) {
+      return await renderShiftStart(req, res, req.body, "Select an active team member.");
     }
     if (!shift) {
-      return renderShiftStart(req, res, req.body, "Add at least one active shift definition before starting a shift.");
+      return await renderShiftStart(req, res, req.body, "Add at least one active shift definition before starting a shift.");
     }
-    const openPump = one(
+    const openPump = await one(
       `SELECT p.name pump, u.name user_name
        FROM shift_entries se
        JOIN nozzles n ON n.id=se.nozzle_id
@@ -1220,8 +1608,8 @@ app.route("/shift/start")
        LIMIT 1`,
       [pumpId]
     );
-    if (openPump) return renderShiftStart(req, res, req.body, `${openPump.pump} is already active with ${openPump.user_name}. Edit the active pump instead of starting it again.`);
-    const openUser = one(
+    if (openPump) return await renderShiftStart(req, res, req.body, `${openPump.pump} is already active with ${openPump.user_name}. Edit the active pump instead of starting it again.`);
+    const openUser = await one(
       `SELECT u.name user_name, p.name pump
        FROM shift_entries se
        JOIN users u ON u.id=se.user_id
@@ -1231,10 +1619,10 @@ app.route("/shift/start")
        LIMIT 1`,
       [userId]
     );
-    if (openUser) return renderShiftStart(req, res, req.body, `${openUser.user_name} is already assigned to ${openUser.pump}. Close or edit that active pump first.`);
-    const nozzles = all("SELECT * FROM nozzles WHERE pump_id=? AND status='Active' ORDER BY product, name", [pumpId]);
+    if (openUser) return await renderShiftStart(req, res, req.body, `${openUser.user_name} is already assigned to ${openUser.pump}. Close or edit that active pump first.`);
+    const nozzles = await all("SELECT * FROM nozzles WHERE pump_id=? AND status='Active' ORDER BY product, name", [pumpId]);
     if (!nozzles.length) {
-      return renderShiftStart(req, res, req.body, "Selected pump is not configured for MS/HSD.");
+      return await renderShiftStart(req, res, req.body, "Selected pump is not configured for MS/HSD.");
     }
     let created = 0;
     for (const nozzle of nozzles) {
@@ -1242,29 +1630,29 @@ app.route("/shift/start")
       if (opening === "" || opening == null) opening = dayOpeningMeter(day.id, nozzle.id);
       if (opening === "" || opening == null) opening = lastMeter(nozzle.id);
       if (opening == null) {
-        return renderShiftStart(req, res, req.body, `Enter opening meter for ${nozzle.product}.`);
+        return await renderShiftStart(req, res, req.body, `Enter opening meter for ${nozzle.product}.`);
       }
-      if (one("SELECT id FROM shift_entries WHERE nozzle_id=? AND status='Open'", [nozzle.id])) continue;
-      run(
+      if (await one("SELECT id FROM shift_entries WHERE nozzle_id=? AND status='Open'", [nozzle.id])) continue;
+      await run(
         `INSERT INTO shift_entries(day_id, business_date, shift_def_id, user_id, nozzle_id, tank_id, product, opening_meter, rate)
          VALUES(?,?,?,?,?,?,?,?,?)`,
         [day.id, day.business_date, shift.id, userId, nozzle.id, nozzle.tank_id, nozzle.product, Number(opening), productPrice(day, nozzle.product)]
       );
       created += 1;
     }
-    if (!created) return renderShiftStart(req, res, req.body, "No shift created. The selected pump may already be active.");
+    if (!created) return await renderShiftStart(req, res, req.body, "No shift created. The selected pump may already be active.");
     flash(req, "success", `Shift started for selected pump.`);
     res.redirect("/shifts/active");
   });
 
-app.get("/shifts/active", requireLogin, (req, res) => {
-  let entries = activePumpGroups(req);
+app.get("/shifts/active", requireLogin, async (req, res) => {
+  let entries = await activePumpGroups(req);
   entries = entries.map((r) => ({ ...r, actions: `<a class="link-button secondary" href="/shift/pump/${esc(r.pump_id)}/edit">Edit</a>` }));
   res.send(layout(req, "Active Shifts", `${pageHead("Active Shifts", "Operations > Active Shifts", '<a class="primary link-button" href="/shift/close">Close Shift</a>')}${table(entries)}`));
 });
 
-function renderPumpShiftEdit(req, res, pump, entries, values = {}, error = "") {
-  const users = all("SELECT * FROM users WHERE status='Active' AND role IN ('manager','pump_boy') ORDER BY name");
+async function renderPumpShiftEdit(req, res, pump, entries, values = {}, error = "") {
+  const users = await all("SELECT * FROM users WHERE status='Active' AND role IN ('manager','pump_boy') ORDER BY name");
   const selectedUser = fieldValue(values, "user_id", entries[0]?.user_id || "");
   res.send(layout(req, "Edit Active Pump", `${pageHead(`Edit ${pump.name}`, "Operations > Active Pump")}
     <section class="form-card"><form method="post" class="grid-form">
@@ -1275,12 +1663,12 @@ function renderPumpShiftEdit(req, res, pump, entries, values = {}, error = "") {
     </form></section>`));
 }
 
-app.get("/shift/pump/:pumpId/edit", requireLogin, (req, res) => {
-  const pump = one("SELECT * FROM pumps WHERE id=?", [Number(req.params.pumpId)]);
+app.get("/shift/pump/:pumpId/edit", requireLogin, async (req, res) => {
+  const pump = await one("SELECT * FROM pumps WHERE id=?", [Number(req.params.pumpId)]);
   if (!pump) return res.redirect("/shifts/active");
   const where = req.user.role === "pump_boy" ? "AND se.user_id=?" : "";
   const params = req.user.role === "pump_boy" ? [pump.id, req.user.id] : [pump.id];
-  const entries = all(
+  const entries = await all(
     `SELECT se.id, se.user_id, se.product, se.opening_meter
      FROM shift_entries se JOIN nozzles n ON n.id=se.nozzle_id
      WHERE n.pump_id=? AND se.status='Open' ${where}
@@ -1288,13 +1676,13 @@ app.get("/shift/pump/:pumpId/edit", requireLogin, (req, res) => {
     params
   );
   if (!entries.length) return res.redirect("/shifts/active");
-  renderPumpShiftEdit(req, res, pump, entries);
+  await renderPumpShiftEdit(req, res, pump, entries);
 });
 
-app.post("/shift/pump/:pumpId/edit", requireLogin, (req, res) => {
-  const pump = one("SELECT * FROM pumps WHERE id=?", [Number(req.params.pumpId)]);
+app.post("/shift/pump/:pumpId/edit", requireLogin, async (req, res) => {
+  const pump = await one("SELECT * FROM pumps WHERE id=?", [Number(req.params.pumpId)]);
   if (!pump) return res.redirect("/shifts/active");
-  const entries = all(
+  const entries = await all(
     `SELECT se.id, se.user_id, se.product, se.opening_meter
      FROM shift_entries se JOIN nozzles n ON n.id=se.nozzle_id
      WHERE n.pump_id=? AND se.status='Open'
@@ -1304,28 +1692,28 @@ app.post("/shift/pump/:pumpId/edit", requireLogin, (req, res) => {
   if (!entries.length) return res.redirect("/shifts/active");
   if (req.user.role === "pump_boy") return res.status(403).send("Forbidden");
   const userId = Number(req.body.user_id);
-  const user = one("SELECT id, name FROM users WHERE id=? AND status='Active'", [userId]);
-  if (!user) return renderPumpShiftEdit(req, res, pump, entries, req.body, "Select an active team member.");
-  const openUser = one(
+  const user = await one("SELECT id, name FROM users WHERE id=? AND status='Active'", [userId]);
+  if (!user) return await renderPumpShiftEdit(req, res, pump, entries, req.body, "Select an active team member.");
+  const openUser = await one(
     `SELECT p.name pump
      FROM shift_entries se JOIN nozzles n ON n.id=se.nozzle_id JOIN pumps p ON p.id=n.pump_id
      WHERE se.user_id=? AND se.status='Open' AND p.id<>?
      LIMIT 1`,
     [userId, pump.id]
   );
-  if (openUser) return renderPumpShiftEdit(req, res, pump, entries, req.body, `${user.name} is already assigned to ${openUser.pump}.`);
+  if (openUser) return await renderPumpShiftEdit(req, res, pump, entries, req.body, `${user.name} is already assigned to ${openUser.pump}.`);
   for (const e of entries) {
     const opening = Number(req.body[`opening_meter_${e.id}`]);
-    if (Number.isNaN(opening)) return renderPumpShiftEdit(req, res, pump, entries, req.body, `Enter opening meter for ${e.product}.`);
-    run("UPDATE shift_entries SET user_id=?, opening_meter=? WHERE id=? AND status='Open'", [userId, opening, e.id]);
+    if (Number.isNaN(opening)) return await renderPumpShiftEdit(req, res, pump, entries, req.body, `Enter opening meter for ${e.product}.`);
+    await run("UPDATE shift_entries SET user_id=?, opening_meter=? WHERE id=? AND status='Open'", [userId, opening, e.id]);
   }
   flash(req, "success", `${pump.name} active shift updated.`);
   res.redirect("/shifts/active");
 });
 
-function renderShiftClose(req, res, values = {}, error = "") {
-  const openPumps = activePumpGroups(req);
-  const customers = all("SELECT * FROM customers WHERE status='Active' ORDER BY name");
+async function renderShiftClose(req, res, values = {}, error = "") {
+  const openPumps = await activePumpGroups(req);
+  const customers = await all("SELECT * FROM customers WHERE status='Active' ORDER BY name");
   const selectedPumpId = Number(fieldValue(values, "pump_id", req.query.pump_id || openPumps[0]?.pump_id || ""));
   const selectedPump = openPumps.find((p) => Number(p.pump_id) === selectedPumpId);
   res.send(layout(req, "Close Shift", `${pageHead("Close Shift", "Operations > Close Shift")}
@@ -1353,14 +1741,14 @@ function renderShiftClose(req, res, values = {}, error = "") {
 }
 
 app.route("/shift/close")
-  .get(requireLogin, (req, res) => {
-    renderShiftClose(req, res);
+  .get(requireLogin, async (req, res) => {
+    await renderShiftClose(req, res);
   })
-  .post(requireLogin, (req, res) => {
+  .post(requireLogin, async (req, res) => {
     const pumpId = Number(req.body.pump_id);
     const where = req.user.role === "pump_boy" ? "AND se.user_id=?" : "";
     const params = req.user.role === "pump_boy" ? [pumpId, req.user.id] : [pumpId];
-    const entries = all(
+    const entries = await all(
       `SELECT se.*, p.name pump, u.name user_name
        FROM shift_entries se
        JOIN users u ON u.id=se.user_id
@@ -1370,28 +1758,25 @@ app.route("/shift/close")
        ORDER BY se.product`,
       params
     );
-    if (!entries.length) return renderShiftClose(req, res, req.body, "Active pump not found.");
+    if (!entries.length) return await renderShiftClose(req, res, req.body, "Active pump not found.");
     const calculated = [];
     for (const entry of entries) {
       const closing = Number(req.body[`closing_${entry.product}`]);
-      if (Number.isNaN(closing)) return renderShiftClose(req, res, req.body, `Enter ${entry.product} closing meter.`);
-      if (closing < Number(entry.opening_meter)) return renderShiftClose(req, res, req.body, `${entry.product} closing cannot be less than opening.`);
+      if (Number.isNaN(closing)) return await renderShiftClose(req, res, req.body, `Enter ${entry.product} closing meter.`);
+      if (closing < Number(entry.opening_meter)) return await renderShiftClose(req, res, req.body, `${entry.product} closing cannot be less than opening.`);
       const testingQty = litres(req.body[`testing_${entry.product}`] || 0);
       const sold = Math.max(0, litres(closing - Number(entry.opening_meter) - testingQty));
       const amount = money(sold * Number(entry.rate));
       calculated.push({ entry, closing, testingQty, sold, amount });
     }
-    const currentPayments = calculated.reduce(
-      (totals, item) => {
-        const p = getShiftPaymentsTotal(item.entry.id);
-        totals.cash += Number(p.cash || 0);
-        totals.upi += Number(p.upi || 0);
-        totals.card += Number(p.card || 0);
-        totals.credit += Number(p.credit || 0);
-        return totals;
-      },
-      { cash: 0, upi: 0, card: 0, credit: 0 }
-    );
+    const currentPayments = { cash: 0, upi: 0, card: 0, credit: 0 };
+    for (const item of calculated) {
+      const p = await getShiftPaymentsTotal(item.entry.id);
+      currentPayments.cash += Number(p.cash || 0);
+      currentPayments.upi += Number(p.upi || 0);
+      currentPayments.card += Number(p.card || 0);
+      currentPayments.credit += Number(p.credit || 0);
+    }
     const totalAmount = money(calculated.reduce((a, item) => a + item.amount, 0));
     const cash = money(currentPayments.cash + money(req.body.cash));
     const upi = money(currentPayments.upi + money(req.body.upi));
@@ -1403,7 +1788,7 @@ app.route("/shift/close")
     const shortage = money(cash + upi + card + credit + expenses + beta + misc - totalAmount);
     const customerId = req.body.customer_id || null;
     if (credit > 0 && !customerId && Number(currentPayments.credit) === 0) {
-      return renderShiftClose(req, res, req.body, "Select a credit customer for credit sale.");
+      return await renderShiftClose(req, res, req.body, "Select a credit customer for credit sale.");
     }
     const share = (value, amount) => (totalAmount > 0 ? money(value * (amount / totalAmount)) : 0);
     for (let i = 0; i < calculated.length; i += 1) {
@@ -1417,7 +1802,7 @@ app.route("/shift/close")
       const allocatedBeta = isLast ? money(beta - calculated.slice(0, i).reduce((a, x) => a + share(beta, x.amount), 0)) : share(beta, item.amount);
       const allocatedMisc = isLast ? money(misc - calculated.slice(0, i).reduce((a, x) => a + share(misc, x.amount), 0)) : share(misc, item.amount);
       const allocatedShortage = isLast ? money(shortage - calculated.slice(0, i).reduce((a, x) => a + share(shortage, x.amount), 0)) : share(shortage, item.amount);
-      run(
+      await run(
         `UPDATE shift_entries SET closing_meter=?, litres_sold=?, sales_amount=?, cash=?, upi=?, card=?, credit=?,
          customer_id=?, expenses=?, beta=?, miscellaneous=?, remarks=?, shortage_excess=?, testing_qty=?, status='Closed',
          closed_at=CURRENT_TIMESTAMP WHERE id=?`,
@@ -1439,22 +1824,22 @@ app.route("/shift/close")
           item.entry.id,
         ]
       );
-      run("UPDATE tanks SET current_stock=current_stock-? WHERE id=?", [item.sold, item.entry.tank_id]);
+      await run("UPDATE tanks SET current_stock=current_stock-? WHERE id=?", [item.sold, item.entry.tank_id]);
     }
-    if (expenses) run("INSERT INTO expenses(business_date, shift_entry_id, paid_by, category, amount, note, payment_mode) VALUES(?,?,?,?,?,?,?)", [entries[0].business_date, entries[0].id, entries[0].user_id, req.body.expense_category || "Miscellaneous", expenses, req.body.expense_note || "", "Cash"]);
+    if (expenses) await run("INSERT INTO expenses(business_date, shift_entry_id, paid_by, category, amount, note, payment_mode) VALUES(?,?,?,?,?,?,?)", [entries[0].business_date, entries[0].id, entries[0].user_id, req.body.expense_category || "Miscellaneous", expenses, req.body.expense_note || "", "Cash"]);
     if (customerId && credit > 0 && Number(currentPayments.credit) === 0) {
-      run("UPDATE customers SET balance=balance+? WHERE id=?", [credit, customerId]);
+      await run("UPDATE customers SET balance=balance+? WHERE id=?", [credit, customerId]);
       for (const item of calculated) {
         const allocatedCredit = share(credit, item.amount);
-        if (allocatedCredit > 0) run("INSERT INTO credit_ledger(customer_id, business_date, entry_type, product, litres, amount, pump_nozzle, team_member, shift_entry_id, notes) VALUES(?,?,?,?,?,?,?,?,?,?)", [customerId, item.entry.business_date, "credit", item.entry.product, item.sold, allocatedCredit, item.entry.pump, item.entry.user_name, item.entry.id, req.body.remarks || ""]);
+        if (allocatedCredit > 0) await run("INSERT INTO credit_ledger(customer_id, business_date, entry_type, product, litres, amount, pump_nozzle, team_member, shift_entry_id, notes) VALUES(?,?,?,?,?,?,?,?,?,?)", [customerId, item.entry.business_date, "credit", item.entry.product, item.sold, allocatedCredit, item.entry.pump, item.entry.user_name, item.entry.id, req.body.remarks || ""]);
       }
     }
     flash(req, Math.abs(shortage) <= 0.01 ? "success" : "warning", `Pump closed. Sales ${rs(totalAmount)} | Shortage/Excess ${rs(shortage)}`);
     res.redirect(`/reports?start=${encodeURIComponent(entries[0].business_date)}&end=${encodeURIComponent(entries[0].business_date)}`);
   });
 
-app.get("/shift/summary/:id", requireLogin, (req, res) => {
-  const se = one(
+app.get("/shift/summary/:id", requireLogin, async (req, res) => {
+  const se = await one(
     `SELECT se.*, u.name user_name, sd.name shift_name, p.name pump
      FROM shift_entries se JOIN users u ON u.id=se.user_id JOIN shift_defs sd ON sd.id=se.shift_def_id
      JOIN nozzles n ON n.id=se.nozzle_id JOIN pumps p ON p.id=n.pump_id WHERE se.id=?`,
@@ -1471,9 +1856,9 @@ app.get("/shift/summary/:id", requireLogin, (req, res) => {
 });
 
 app.route("/purchase")
-  .get(requireLogin, requireRoles("admin", "manager"), (req, res) => {
-    const tanks = all("SELECT * FROM tanks WHERE status='Active'");
-    const purchases = all("SELECT p.*, t.name tank FROM purchases p JOIN tanks t ON t.id=p.tank_id ORDER BY p.business_date DESC, p.id DESC");
+  .get(requireLogin, requireRoles("admin", "manager"), async (req, res) => {
+    const tanks = await all("SELECT * FROM tanks WHERE status='Active'");
+    const purchases = await all("SELECT p.*, t.name tank FROM purchases p JOIN tanks t ON t.id=p.tank_id ORDER BY p.business_date DESC, p.id DESC");
     res.send(layout(req, "Fuel Inward", `${pageHead("Fuel Inward", "Operations > Purchase")}
       <section class="form-card"><form method="post" class="grid-form">
         <label class="field"><span>Business date</span><input name="business_date" type="date" value="${todayIso()}" required></label>
@@ -1486,22 +1871,22 @@ app.route("/purchase")
         <div class="action-row"><button class="primary">Add Purchase</button></div>
       </form></section>${table(purchases)}`));
   })
-  .post(requireLogin, requireRoles("admin", "manager"), (req, res) => {
-    const tank = one("SELECT * FROM tanks WHERE id=?", [Number(req.body.tank_id)]);
+  .post(requireLogin, requireRoles("admin", "manager"), async (req, res) => {
+    const tank = await one("SELECT * FROM tanks WHERE id=?", [Number(req.body.tank_id)]);
     const qty = litres(req.body.quantity);
     const rate = money(req.body.rate);
     const before = litres(tank.current_stock);
     const after = litres(before + qty);
-    run("INSERT INTO purchases(business_date, product, quantity, supplier, invoice_number, rate, total_amount, tank_id, before_stock, after_stock, notes) VALUES(?,?,?,?,?,?,?,?,?,?,?)", [req.body.business_date, tank.product, qty, req.body.supplier || "", req.body.invoice_number || "", rate, money(qty * rate), tank.id, before, after, req.body.notes || ""]);
-    run("UPDATE tanks SET current_stock=? WHERE id=?", [after, tank.id]);
+    await run("INSERT INTO purchases(business_date, product, quantity, supplier, invoice_number, rate, total_amount, tank_id, before_stock, after_stock, notes) VALUES(?,?,?,?,?,?,?,?,?,?,?)", [req.body.business_date, tank.product, qty, req.body.supplier || "", req.body.invoice_number || "", rate, money(qty * rate), tank.id, before, after, req.body.notes || ""]);
+    await run("UPDATE tanks SET current_stock=? WHERE id=?", [after, tank.id]);
     flash(req, "success", "Fuel purchase added and tank stock increased.");
     res.redirect("/purchase");
   });
 
 app.route("/credit/payment")
-  .get(requireLogin, requireRoles("admin", "manager"), (req, res) => {
-    const customers = all("SELECT * FROM customers WHERE status='Active' ORDER BY name");
-    const ledger = all("SELECT cl.*, c.name customer FROM credit_ledger cl JOIN customers c ON c.id=cl.customer_id ORDER BY cl.business_date DESC, cl.id DESC LIMIT 100");
+  .get(requireLogin, requireRoles("admin", "manager"), async (req, res) => {
+    const customers = await all("SELECT * FROM customers WHERE status='Active' ORDER BY name");
+    const ledger = await all("SELECT cl.*, c.name customer FROM credit_ledger cl JOIN customers c ON c.id=cl.customer_id ORDER BY cl.business_date DESC, cl.id DESC LIMIT 100");
     res.send(layout(req, "Credit Payments", `${pageHead("Credit Payments", "Operations > Credit")}
       <section class="form-card"><form method="post" class="grid-form">
         <label class="field"><span>Business date</span><input name="business_date" type="date" value="${todayIso()}" required></label>
@@ -1512,23 +1897,23 @@ app.route("/credit/payment")
         <div class="action-row"><button class="primary">Record Payment</button></div>
       </form></section>${table(ledger)}`));
   })
-  .post(requireLogin, requireRoles("admin", "manager"), (req, res) => {
+  .post(requireLogin, requireRoles("admin", "manager"), async (req, res) => {
     const amount = money(req.body.amount);
-    run("UPDATE customers SET balance=balance-? WHERE id=?", [amount, Number(req.body.customer_id)]);
-    run("INSERT INTO credit_ledger(customer_id, business_date, entry_type, amount, payment_mode, notes) VALUES(?,?,?,?,?,?)", [Number(req.body.customer_id), req.body.business_date, "payment", amount, req.body.payment_mode || "Cash", req.body.notes || ""]);
+    await run("UPDATE customers SET balance=balance-? WHERE id=?", [amount, Number(req.body.customer_id)]);
+    await run("INSERT INTO credit_ledger(customer_id, business_date, entry_type, amount, payment_mode, notes) VALUES(?,?,?,?,?,?)", [Number(req.body.customer_id), req.body.business_date, "payment", amount, req.body.payment_mode || "Cash", req.body.notes || ""]);
     flash(req, "success", "Credit payment recorded.");
     res.redirect("/credit/payment");
   });
 
 app.route("/day/close")
-  .get(requireLogin, requireRoles("admin", "manager"), (req, res) => {
-    const day = activeDay();
+  .get(requireLogin, requireRoles("admin", "manager"), async (req, res) => {
+    const day = await activeDay();
     if (!day) {
       flash(req, "error", "No open day to close.");
       return res.redirect("/");
     }
-    const openCount = one("SELECT COUNT(*) c FROM shift_entries WHERE day_id=? AND status='Open'", [day.id]).c;
-    const metrics = dashboardMetrics();
+    const openCount = (await one("SELECT COUNT(*) c FROM shift_entries WHERE day_id=? AND status='Open'", [day.id])).c;
+    const metrics = await dashboardMetrics();
     res.send(layout(req, "Day Closing", `${pageHead("Day Closing", "Operations > Day Closing")}
       <section class="stat-grid"><div class="stat"><span>Open shifts</span><strong>${esc(openCount)}</strong></div><div class="stat"><span>Sales</span><strong>${rs(metrics.totals.sales)}</strong></div><div class="stat"><span>Cash</span><strong>${rs(metrics.totals.cash)}</strong></div><div class="stat"><span>Credit</span><strong>${rs(metrics.totals.credit)}</strong></div></section>
       <section class="form-card"><form method="post" class="grid-form">
@@ -1538,32 +1923,32 @@ app.route("/day/close")
         <div class="action-row"><button class="primary">Close Day</button></div>
       </form></section>`));
   })
-  .post(requireLogin, requireRoles("admin", "manager"), (req, res) => {
-    const day = activeDay();
-    const openCount = one("SELECT COUNT(*) c FROM shift_entries WHERE day_id=? AND status='Open'", [day.id]).c;
+  .post(requireLogin, requireRoles("admin", "manager"), async (req, res) => {
+    const day = await activeDay();
+    const openCount = (await one("SELECT COUNT(*) c FROM shift_entries WHERE day_id=? AND status='Open'", [day.id])).c;
     if (openCount) {
       flash(req, "error", "Close all open shifts before day closing.");
       return res.redirect("/day/close");
     }
     const actualMs = litres(req.body.actual_ms);
     const actualHsd = litres(req.body.actual_hsd);
-    run("UPDATE days SET actual_ms=?, actual_hsd=?, actual_cash=?, status='Closed', closed_at=CURRENT_TIMESTAMP WHERE id=?", [actualMs, actualHsd, money(req.body.actual_cash), day.id]);
+    await run("UPDATE days SET actual_ms=?, actual_hsd=?, actual_cash=?, status='Closed', closed_at=CURRENT_TIMESTAMP WHERE id=?", [actualMs, actualHsd, money(req.body.actual_cash), day.id]);
     for (const [product, actual] of [["MS", actualMs], ["HSD", actualHsd]]) {
-      const tanks = all("SELECT * FROM tanks WHERE product=? AND status='Active'", [product]);
+      const tanks = await all("SELECT * FROM tanks WHERE product=? AND status='Active'", [product]);
       const total = tanks.reduce((a, t) => a + Number(t.current_stock || 0), 0) || 1;
-      for (const tank of tanks) run("UPDATE tanks SET current_stock=? WHERE id=?", [actual * (Number(tank.current_stock || 0) / total), tank.id]);
+      for (const tank of tanks) await run("UPDATE tanks SET current_stock=? WHERE id=?", [actual * (Number(tank.current_stock || 0) / total), tank.id]);
     }
     flash(req, "success", "Day closed and entries locked.");
     res.redirect("/reports");
   });
 
-app.post("/day/reopen/:id", requireLogin, requireRoles("admin"), (req, res) => {
-  run("UPDATE days SET status='Open', closed_at=NULL WHERE id=?", [Number(req.params.id)]);
+app.post("/day/reopen/:id", requireLogin, requireRoles("admin"), async (req, res) => {
+  await run("UPDATE days SET status='Open', closed_at=NULL WHERE id=?", [Number(req.params.id)]);
   flash(req, "warning", "Day reopened for admin corrections.");
   res.redirect("/");
 });
 
-app.get("/reports", requireLogin, (req, res) => {
+app.get("/reports", requireLogin, async (req, res) => {
   const start = req.query.start || todayIso();
   const end = req.query.end || start;
   const product = req.query.product || "";
@@ -1578,7 +1963,7 @@ app.get("/reports", requireLogin, (req, res) => {
     extra += " AND se.user_id=?";
     params.push(userId);
   }
-  const shiftRows = all(
+  const shiftRows = await all(
     `SELECT se.business_date, p.id pump_id, p.name pump, u.name user_name, sd.name shift_name, se.product,
      se.litres_sold, se.sales_amount, se.cash, se.upi, se.card, se.credit, se.expenses, se.beta, se.shortage_excess, se.status
      FROM shift_entries se JOIN users u ON u.id=se.user_id JOIN shift_defs sd ON sd.id=se.shift_def_id
@@ -1620,7 +2005,7 @@ app.get("/reports", requireLogin, (req, res) => {
     item.shortage_excess = money(Number(item.shortage_excess) + Number(row.shortage_excess || 0));
   }
   const shifts = Array.from(reportMap.values());
-  const summary = one(
+  const summary = await one(
     `SELECT COALESCE(SUM(litres_sold),0) litres, COALESCE(SUM(sales_amount),0) sales,
      COALESCE(SUM(cash),0) cash, COALESCE(SUM(upi),0) upi, COALESCE(SUM(card),0) card,
      COALESCE(SUM(credit),0) credit, COALESCE(SUM(expenses),0) expenses,
@@ -1639,8 +2024,8 @@ app.get("/reports", requireLogin, (req, res) => {
     <section class="table-card">${table(shifts)}</section>`));
 });
 
-app.get("/export/shifts.csv", requireLogin, requireRoles("admin", "manager"), (_req, res) => {
-  const rows = all("SELECT business_date, product, litres_sold, sales_amount, cash, upi, card, credit, expenses, beta, shortage_excess, status FROM shift_entries ORDER BY business_date DESC");
+app.get("/export/shifts.csv", requireLogin, requireRoles("admin", "manager"), async (_req, res) => {
+  const rows = await all("SELECT business_date, product, litres_sold, sales_amount, cash, upi, card, credit, expenses, beta, shortage_excess, status FROM shift_entries ORDER BY business_date DESC");
   const lines = ["date,product,litres,sales,cash,upi,card,credit,expenses,beta,shortage_excess,status"];
   for (const row of rows) lines.push(Object.values(row).map((v) => `"${String(v ?? 0).replaceAll('"', '""')}"`).join(","));
   res.setHeader("Content-Type", "text/csv");
@@ -1648,26 +2033,34 @@ app.get("/export/shifts.csv", requireLogin, requireRoles("admin", "manager"), (_
   res.send(lines.join("\n"));
 });
 
-app.get("/health", (_req, res) => {
-  initDb();
+app.get("/health", async (_req, res) => {
+  await initDb();
   res.json({
     ok: true,
     runtime: "node",
-    database: path.basename(DATABASE),
-    database_dir: path.dirname(DATABASE),
-    database_source: process.env.PETROL_DB ? "PETROL_DB" : process.env.PETROL_DATA_DIR ? "PETROL_DATA_DIR" : "default_persistent",
+    database: USING_MYSQL ? MYSQL_CONFIG.database : path.basename(DATABASE),
+    database_dir: USING_MYSQL ? MYSQL_CONFIG.host : path.dirname(DATABASE),
+    database_source: USING_MYSQL ? "mysql" : process.env.PETROL_DB ? "PETROL_DB" : process.env.PETROL_DATA_DIR ? "PETROL_DATA_DIR" : "default_persistent",
   });
 });
 
 async function start() {
-  const SQL = await initSqlJs();
-  prepareDatabaseFile();
-  const fileBuffer = fs.existsSync(DATABASE) ? fs.readFileSync(DATABASE) : null;
-  db = fileBuffer ? new SQL.Database(fileBuffer) : new SQL.Database();
-  db.exec("PRAGMA foreign_keys = ON");
-  initDb();
+  if (USING_MYSQL) {
+    if (!MYSQL_CONFIG.database || !MYSQL_CONFIG.user || !MYSQL_CONFIG.password) {
+      throw new Error("MySQL is enabled, but DB_NAME, DB_USER, or DB_PASSWORD is missing.");
+    }
+    mysqlPool = await mysql.createPool(MYSQL_CONFIG);
+    db = mysqlPool;
+  } else {
+    const SQL = await initSqlJs();
+    prepareDatabaseFile();
+    const fileBuffer = fs.existsSync(DATABASE) ? fs.readFileSync(DATABASE) : null;
+    db = fileBuffer ? new SQL.Database(fileBuffer) : new SQL.Database();
+    db.exec("PRAGMA foreign_keys = ON");
+  }
+  await initDb();
   app.listen(PORT, "0.0.0.0", () => {
-    console.log(`Petrol Station Manager running on port ${PORT}`);
+    console.log(`Petrol Station Manager running on port ${PORT} using ${DB_DIALECT}`);
   });
 }
 
