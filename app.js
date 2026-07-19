@@ -2435,7 +2435,7 @@ app.get("/reports", requireLogin, async (req, res) => {
     : await all("SELECT id, name FROM users WHERE status='Active' AND role IN ('admin','manager','pump_boy') ORDER BY name");
   const shiftRows = await all(
     `SELECT se.business_date, d.ms_price, d.hsd_price, p.id pump_id, p.name pump, u.name user_name, sd.name shift_name, se.product,
-     se.litres_sold, se.sales_amount, se.cash, se.upi, se.credit, se.expenses, se.beta, se.miscellaneous, se.shortage_excess, se.status
+     se.opening_meter, se.closing_meter, se.litres_sold, se.sales_amount, se.cash, se.upi, se.credit, se.expenses, se.beta, se.miscellaneous, se.shortage_excess, se.status
      FROM shift_entries se JOIN users u ON u.id=se.user_id JOIN shift_defs sd ON sd.id=se.shift_def_id
      JOIN nozzles n ON n.id=se.nozzle_id JOIN pumps p ON p.id=n.pump_id
      LEFT JOIN days d ON d.id=se.day_id
@@ -2454,7 +2454,11 @@ app.get("/reports", requireLogin, async (req, res) => {
         shift: row.shift_name,
         ms_price: money(row.ms_price || 0),
         hsd_price: money(row.hsd_price || 0),
+        ms_opening: "",
+        ms_closing: "",
         ms_litres: 0,
+        hsd_opening: "",
+        hsd_closing: "",
         hsd_litres: 0,
         sales: 0,
         cash: 0,
@@ -2468,8 +2472,16 @@ app.get("/reports", requireLogin, async (req, res) => {
       });
     }
     const item = reportMap.get(key);
-    if (row.product === "MS") item.ms_litres = litres(Number(item.ms_litres) + Number(row.litres_sold || 0));
-    if (row.product === "HSD") item.hsd_litres = litres(Number(item.hsd_litres) + Number(row.litres_sold || 0));
+    if (row.product === "MS") {
+      item.ms_opening = row.opening_meter;
+      item.ms_closing = row.closing_meter ?? "";
+      item.ms_litres = litres(Number(item.ms_litres) + Number(row.litres_sold || 0));
+    }
+    if (row.product === "HSD") {
+      item.hsd_opening = row.opening_meter;
+      item.hsd_closing = row.closing_meter ?? "";
+      item.hsd_litres = litres(Number(item.hsd_litres) + Number(row.litres_sold || 0));
+    }
     item.sales = money(Number(item.sales) + Number(row.sales_amount || 0));
     item.cash = money(Number(item.cash) + Number(row.cash || 0));
     item.phone_pay = money(Number(item.phone_pay) + Number(row.upi || 0));
@@ -2509,7 +2521,11 @@ app.get("/reports", requireLogin, async (req, res) => {
   );
   const salesmanRows = await all(
     `SELECT se.business_date, p.name pump, u.name team_member,
+     MIN(CASE WHEN se.product='MS' THEN se.opening_meter END) ms_opening,
+     MAX(CASE WHEN se.product='MS' THEN se.closing_meter END) ms_closing,
      COALESCE(SUM(CASE WHEN se.product='MS' THEN se.litres_sold ELSE 0 END),0) ms_litres,
+     MIN(CASE WHEN se.product='HSD' THEN se.opening_meter END) hsd_opening,
+     MAX(CASE WHEN se.product='HSD' THEN se.closing_meter END) hsd_closing,
      COALESCE(SUM(CASE WHEN se.product='HSD' THEN se.litres_sold ELSE 0 END),0) hsd_litres,
      COALESCE(SUM(se.sales_amount),0) sales,
      COALESCE(SUM(se.cash),0) cash,
@@ -2536,8 +2552,8 @@ app.get("/reports", requireLogin, async (req, res) => {
       <div class="action-row"><button class="primary">Filter</button></div>
     </form></section>
     <section class="stat-grid"><div class="stat"><span>MS litres</span><strong>${ltr(summary.ms_litres)}</strong></div><div class="stat"><span>HSD litres</span><strong>${ltr(summary.hsd_litres)}</strong></div><div class="stat hero"><span>Sales</span><strong>${rs(summary.sales)}</strong></div><div class="stat"><span>Cash</span><strong>${rs(summary.cash)}</strong></div><div class="stat"><span>Phone Pay</span><strong>${rs(summary.upi)}</strong></div><div class="stat"><span>Credit</span><strong>${rs(summary.credit)}</strong></div><div class="stat"><span>Shortage</span><strong>${rs(summary.shortage)}</strong></div></section>
-    <section class="table-card"><div class="table-card-head"><div><h2>Complete Sales Data</h2><p>Pump-wise MS/HSD sales grouped for the selected dates.</p></div></div>${tableColumns(shifts, ["business_date", "pump", "team_member", "shift", "ms_price", "hsd_price", "ms_litres", "hsd_litres", "sales", "cash", "phone_pay", "credit", "beta", "miscellaneous", "expenses", "shortage_excess", "status"])}</section>
-    <section class="table-card"><div class="table-card-head"><div><h2>Salesperson Date Data</h2><p>Daily totals by pump and team member.</p></div></div>${tableColumns(salesmanRows, ["business_date", "pump", "team_member", "ms_litres", "hsd_litres", "sales", "cash", "phone_pay", "credit", "beta", "miscellaneous", "shortage_excess"])}</section>
+    <section class="table-card"><div class="table-card-head"><div><h2>Complete Sales Data</h2><p>Pump-wise MS/HSD readings and sales grouped for the selected dates.</p></div></div>${tableColumns(shifts, ["business_date", "pump", "team_member", "shift", "ms_price", "hsd_price", "ms_opening", "ms_closing", "ms_litres", "hsd_opening", "hsd_closing", "hsd_litres", "sales", "cash", "phone_pay", "credit", "beta", "miscellaneous", "expenses", "shortage_excess", "status"])}</section>
+    <section class="table-card"><div class="table-card-head"><div><h2>Salesperson Date Data</h2><p>Daily readings and totals by pump and team member.</p></div></div>${tableColumns(salesmanRows, ["business_date", "pump", "team_member", "ms_opening", "ms_closing", "ms_litres", "hsd_opening", "hsd_closing", "hsd_litres", "sales", "cash", "phone_pay", "credit", "beta", "miscellaneous", "shortage_excess"])}</section>
     <section class="table-card"><div class="table-card-head"><div><h2>Payment Log Summary</h2><p>Payments logged during active shifts by pump and type.</p></div></div>${tableColumns(paymentRows, ["business_date", "pump", "team_member", "payment_type", "amount", "entries"])}</section>`));
 });
 
