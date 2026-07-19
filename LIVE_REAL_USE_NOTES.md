@@ -85,6 +85,27 @@
 - Day closing login changes are not required now.
 - Pump 2 visibility issue is working now and should not be changed for that reason.
 
+## Paused Price Difference Questions
+
+When resuming the shift/day timing price-difference report, confirm these before implementing:
+
+1. Shift cycle is 9 AM to next day 9 AM, while day reading cycle is 6 AM to next day 6 AM.
+2. Confirm which price applies to the 6 AM to 9 AM overlap:
+   - previous day price
+   - new day price
+   - or the manually changed price timestamp
+3. Confirm how litres for 6 AM to 9 AM should be measured:
+   - separate 6 AM and 9 AM meter readings
+   - shift opening/closing readings
+   - or another entry flow
+4. Confirm report columns:
+   - old price litres
+   - old price sales
+   - new price litres
+   - new price sales
+   - price difference
+5. Confirm whether this belongs only in Day Report or also in Complete Sales Data and Salesperson Date Data.
+
 ## Implementation Order
 
 1. Confirm live MySQL is the only active live database.

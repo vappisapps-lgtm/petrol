@@ -2543,6 +2543,8 @@ app.get("/reports", requireLogin, async (req, res) => {
      ORDER BY se.business_date DESC, ${pumpOrderSql("p")}, u.name`,
     params
   );
+  const reportDays = await all("SELECT * FROM days WHERE business_date BETWEEN ? AND ? ORDER BY business_date DESC, id DESC", [start, end]);
+  const dayReportTables = (await Promise.all(reportDays.map(async (day) => renderDayReport(day, await dayReportRows(day.id))))).join("");
   res.send(layout(req, "Reports", `${pageHead("Reports", "Operations > Reports", '<a class="link-button" href="/export/shifts.csv">Export CSV</a>')}
     <section class="form-card"><form method="get" class="grid-form">
       <label class="field"><span>Start</span><input name="start" type="date" value="${esc(start)}"></label>
@@ -2552,6 +2554,7 @@ app.get("/reports", requireLogin, async (req, res) => {
       <div class="action-row"><button class="primary">Filter</button></div>
     </form></section>
     <section class="stat-grid"><div class="stat"><span>MS litres</span><strong>${ltr(summary.ms_litres)}</strong></div><div class="stat"><span>HSD litres</span><strong>${ltr(summary.hsd_litres)}</strong></div><div class="stat hero"><span>Sales</span><strong>${rs(summary.sales)}</strong></div><div class="stat"><span>Cash</span><strong>${rs(summary.cash)}</strong></div><div class="stat"><span>Phone Pay</span><strong>${rs(summary.upi)}</strong></div><div class="stat"><span>Credit</span><strong>${rs(summary.credit)}</strong></div><div class="stat"><span>Shortage</span><strong>${rs(summary.shortage)}</strong></div></section>
+    ${dayReportTables || '<section class="table-card"><div class="table-card-head"><div><h2>Day Report</h2><p>No day report is available for this date range.</p></div></div><div class="table-wrap"><table><thead><tr><th>Records</th></tr></thead><tbody><tr><td>No records yet.</td></tr></tbody></table></div></section>'}
     <section class="table-card"><div class="table-card-head"><div><h2>Complete Sales Data</h2><p>Pump-wise MS/HSD readings and sales grouped for the selected dates.</p></div></div>${tableColumns(shifts, ["business_date", "pump", "team_member", "shift", "ms_price", "hsd_price", "ms_opening", "ms_closing", "ms_litres", "hsd_opening", "hsd_closing", "hsd_litres", "sales", "cash", "phone_pay", "credit", "beta", "miscellaneous", "expenses", "shortage_excess", "status"])}</section>
     <section class="table-card"><div class="table-card-head"><div><h2>Salesperson Date Data</h2><p>Daily readings and totals by pump and team member.</p></div></div>${tableColumns(salesmanRows, ["business_date", "pump", "team_member", "ms_opening", "ms_closing", "ms_litres", "hsd_opening", "hsd_closing", "hsd_litres", "sales", "cash", "phone_pay", "credit", "beta", "miscellaneous", "shortage_excess"])}</section>
     <section class="table-card"><div class="table-card-head"><div><h2>Payment Log Summary</h2><p>Payments logged during active shifts by pump and type.</p></div></div>${tableColumns(paymentRows, ["business_date", "pump", "team_member", "payment_type", "amount", "entries"])}</section>`));
