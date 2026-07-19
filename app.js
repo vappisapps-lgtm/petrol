@@ -307,6 +307,10 @@ function option(value, label, selected) {
   return `<option value="${esc(value)}"${String(value) === String(selected) ? " selected" : ""}>${esc(label ?? value)}</option>`;
 }
 
+function optionDisabled(value, label, selected, disabled = false) {
+  return `<option value="${esc(value)}"${String(value) === String(selected) ? " selected" : ""}${disabled ? " disabled" : ""}>${esc(label ?? value)}</option>`;
+}
+
 function flash(req, category, message) {
   req.session.flash = req.session.flash || [];
   req.session.flash.push({ category, message });
@@ -981,7 +985,6 @@ function dayOpeningRows(dayId) {
 }
 
 function renderDayStart(req, res, values = {}, error = "") {
-  cleanupGeneratedPumpSetup();
   ensureConfiguredPumpProducts();
   const tanks = all("SELECT * FROM tanks WHERE status='Active' ORDER BY product, name");
   const nozzles = all(
@@ -1085,7 +1088,6 @@ app.route("/day/start")
   });
 
 function renderShiftStart(req, res, values = {}, error = "") {
-  cleanupGeneratedPumpSetup();
   ensureConfiguredPumpProducts();
   const day = activeDay();
   if (!day) {
@@ -1095,7 +1097,20 @@ function renderShiftStart(req, res, values = {}, error = "") {
   const pumps = all("SELECT * FROM pumps WHERE status='Active' ORDER BY CASE WHEN name GLOB 'Pump [0-9]*' THEN CAST(SUBSTR(name, 6) AS INTEGER) ELSE 999999 END, name");
   const users = all("SELECT * FROM users WHERE status='Active' AND role IN ('manager','pump_boy') ORDER BY name");
   const shifts = all("SELECT * FROM shift_defs WHERE status='Active' ORDER BY start_time");
-  const selectedPumpId = Number(fieldValue(values, "pump_id", req.query.pump_id || pumps[0]?.id || ""));
+  const activePumpIds = new Set(
+    all(
+      `SELECT DISTINCT p.id
+       FROM shift_entries se JOIN nozzles n ON n.id=se.nozzle_id JOIN pumps p ON p.id=n.pump_id
+       WHERE se.status='Open'`
+    ).map((r) => Number(r.id))
+  );
+  const activeUserIds = new Set(all("SELECT DISTINCT user_id id FROM shift_entries WHERE status='Open'").map((r) => Number(r.id)));
+  const firstAvailablePump = pumps.find((p) => !activePumpIds.has(Number(p.id))) || pumps[0];
+  const firstAvailableUser = users.find((u) => !activeUserIds.has(Number(u.id))) || users[0];
+  const hasAvailablePump = pumps.some((p) => !activePumpIds.has(Number(p.id)));
+  const hasAvailableUser = users.some((u) => !activeUserIds.has(Number(u.id)));
+  const selectedPumpId = Number(fieldValue(values, "pump_id", req.query.pump_id || firstAvailablePump?.id || ""));
+  const selectedUserId = Number(fieldValue(values, "user_id", firstAvailableUser?.id || req.user.id || ""));
   const nozzles = all(
     `SELECT n.*, p.name pump
      FROM nozzles n JOIN pumps p ON p.id=n.pump_id
@@ -1116,8 +1131,8 @@ function renderShiftStart(req, res, values = {}, error = "") {
   res.send(layout(req, "Start Shift", `${pageHead("Start Shift", "Operations > Start Shift")}
     <section class="form-card"><form method="post" class="grid-form">
       ${inlineError(error)}
-      <label class="field"><span>Pump</span><select name="pump_id" onchange="window.location='/shift/start?pump_id='+this.value">${pumps.map((p) => option(p.id, p.name, selectedPumpId)).join("")}</select></label>
-      <label class="field"><span>Team member</span><select name="user_id">${users.map((u) => option(u.id, u.name, fieldValue(values, "user_id", req.user.id))).join("")}</select></label>
+      <label class="field"><span>Pump</span><select name="pump_id" onchange="if(!this.selectedOptions[0].disabled) window.location='/shift/start?pump_id='+this.value">${pumps.map((p) => optionDisabled(p.id, activePumpIds.has(Number(p.id)) ? `${p.name} - active` : p.name, selectedPumpId, activePumpIds.has(Number(p.id)))).join("")}</select></label>
+      <label class="field"><span>Team member</span><select name="user_id">${users.map((u) => optionDisabled(u.id, activeUserIds.has(Number(u.id)) ? `${u.name} - assigned` : u.name, selectedUserId, activeUserIds.has(Number(u.id)))).join("")}</select></label>
       <label class="field"><span>Time in</span><input name="time_in" type="time" value="${esc(fieldValue(values, "time_in", new Date().toTimeString().slice(0, 5)))}"></label>
       <label class="field"><span>Detected shift</span><select name="shift_def_id"><option value="">Auto by time</option>${shifts.map((s) => option(s.id, `${s.name} (${s.start_time}-${s.end_time})`, fieldValue(values, "shift_def_id", ""))).join("")}</select></label>
       <div class="form-section"><strong>Opening meters</strong><small>Defaults come from the day-start pump readings</small></div>
@@ -1126,7 +1141,7 @@ function renderShiftStart(req, res, values = {}, error = "") {
         const suggested = dayOpeningMeter(day.id, n.id) ?? lastMeter(n.id) ?? 0;
         return `<label class="field"><span>${esc(n.pump)} ${esc(n.product)}</span><input name="${name}" type="number" step="0.001" value="${esc(fieldValue(values, name, suggested))}"></label>`;
       }).join("") || '<div class="form-error span-2">Selected pump is not configured for MS/HSD.</div>'}
-      <div class="action-row"><button class="primary" ${pumps.length && users.length && shifts.length && nozzles.length ? "" : "disabled"}>Start Shift</button></div>
+      <div class="action-row"><button class="primary" ${pumps.length && users.length && shifts.length && nozzles.length && hasAvailablePump && hasAvailableUser ? "" : "disabled"}>Start Shift</button></div>
     </form></section>
     <section class="table-card"><div class="table-card-head"><div><h2>Open Shift Records</h2><p>${esc(day.business_date)} active shift records.</p></div></div>${table(openEntries)}</section>`));
 }
