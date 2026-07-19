@@ -1558,25 +1558,36 @@ async function renderDayStart(req, res, values = {}, error = "") {
   );
   const currentDay = await activeDay();
   const selectedDate = fieldValue(values, "business_date", currentDay?.business_date || todayIso());
-  const editingOpenDay = Boolean(currentDay);
+  const editMode = Boolean(currentDay) && req.query.edit === "1";
+  const lockedOpenDay = Boolean(currentDay) && !editMode;
+  const dayStartActions = currentDay
+    ? `<div style="display:flex;gap:8px;"><a class="primary link-button" href="/day/start?edit=1">Edit</a><a class="secondary link-button" href="/day/close">Close Day</a></div>`
+    : "";
+  const readonlyAttr = lockedOpenDay ? "readonly" : "";
+  const pumpTestingRows = new Map(
+    currentDay
+      ? (await all("SELECT pump_id, ms_qty, hsd_qty FROM day_pump_testing WHERE day_id=?", [currentDay.id])).map((r) => [Number(r.pump_id), r])
+      : []
+  );
   for (const nozzle of nozzles) {
     const currentOpening = currentDay ? await dayOpeningMeter(currentDay.id, nozzle.id) : null;
     const previousOpening = await previousClosedMeter(nozzle.id, selectedDate);
     nozzle.suggested_opening = currentOpening ?? previousOpening ?? 0;
-    nozzle.readonly_opening = !currentDay && previousOpening != null;
+    nozzle.readonly_opening = lockedOpenDay || (!currentDay && previousOpening != null);
   }
   const currentRows = currentDay ? await dayOpeningRows(currentDay.id) : [];
   const recentDays = (await all("SELECT id, business_date, ms_price, hsd_price, status FROM days ORDER BY business_date DESC LIMIT 10")).map((d) => ({
     ...d,
     actions: d.status === "Open" ? '<a class="link-button secondary" href="/day/close">Close day</a>' : "",
   }));
-  res.send(layout(req, "Day Start", `${pageHead("Start Business Day", "Operations > Day Start")}
-    <section class="form-card"><form method="post" class="grid-form">
+  res.send(layout(req, "Day Start", `${pageHead("Start Business Day", "Operations > Day Start", dayStartActions)}
+    <section class="form-card"><form method="post" action="${editMode ? "/day/start?edit=1" : "/day/start"}" class="grid-form">
       ${inlineError(error)}
-      ${editingOpenDay ? '<div class="flash warning span-2">A business day is already open. Save changes here or close the day before starting another.</div>' : ""}
-      <label class="field"><span>Business date / sales date</span><input name="business_date" type="date" value="${esc(selectedDate)}" ${editingOpenDay ? "readonly" : ""} required><small>Opening readings come only from the previous closed day.</small></label>
-      <label class="field"><span>MS price</span><input name="ms_price" type="number" step="0.01" value="${esc(fieldValue(values, "ms_price", currentDay?.ms_price || ""))}" required></label>
-      <label class="field"><span>HSD price</span><input name="hsd_price" type="number" step="0.01" value="${esc(fieldValue(values, "hsd_price", currentDay?.hsd_price || ""))}" required></label>
+      ${lockedOpenDay ? '<div class="flash warning span-2">A business day is already open. Details are locked. Click Edit to make corrections.</div>' : ""}
+      ${editMode ? '<div class="flash warning span-2">Editing the open business day. Save only correction changes.</div>' : ""}
+      <label class="field"><span>Business date / sales date</span><input name="business_date" type="date" value="${esc(selectedDate)}" ${currentDay ? "readonly" : ""} required><small>Opening readings come only from the previous closed day.</small></label>
+      <label class="field"><span>MS price</span><input name="ms_price" type="number" step="0.01" value="${esc(fieldValue(values, "ms_price", currentDay?.ms_price || ""))}" ${readonlyAttr} required></label>
+      <label class="field"><span>HSD price</span><input name="hsd_price" type="number" step="0.01" value="${esc(fieldValue(values, "hsd_price", currentDay?.hsd_price || ""))}" ${readonlyAttr} required></label>
       <div class="form-section"><strong>Pump opening meter readings</strong><small>Previous closing readings for this business date.</small></div>
       ${pumps.map((p) => {
         const pumpMeters = nozzles
@@ -1590,12 +1601,14 @@ async function renderDayStart(req, res, values = {}, error = "") {
         return `<div class="form-section"><strong>${esc(p.name)}</strong><small>Opening meter readings</small></div>${pumpMeters}`;
       }).join("") || '<div class="form-error span-2">Add active pumps before starting the day.</div>'}
       <div class="form-section"><strong>Pump testing values</strong><small>Enter testing quantity for each configured pump.</small></div>
-      ${pumps.map((p) => `
-        <label class="field"><span>${esc(p.name)} MS testing qty</span><input name="testing_${p.id}_MS" type="number" step="0.001" value="${esc(fieldValue(values, `testing_${p.id}_MS`, 0))}"></label>
-        <label class="field"><span>${esc(p.name)} HSD testing qty</span><input name="testing_${p.id}_HSD" type="number" step="0.001" value="${esc(fieldValue(values, `testing_${p.id}_HSD`, 0))}"></label>
-      `).join("")}
-      <label class="field span-2"><span>Notes</span><textarea name="notes">${esc(fieldValue(values, "notes", ""))}</textarea></label>
-      <div class="action-row">${currentDay ? '<a class="secondary link-button" href="/day/close">Close Day</a>' : ""}<button class="primary" ${nozzles.length ? "" : "disabled"}>${editingOpenDay ? "Save Open Day" : "Start Day"}</button></div>
+      ${pumps.map((p) => {
+        const savedTesting = pumpTestingRows.get(Number(p.id)) || {};
+        return `
+        <label class="field"><span>${esc(p.name)} MS testing qty</span><input name="testing_${p.id}_MS" type="number" step="0.001" value="${esc(fieldValue(values, `testing_${p.id}_MS`, savedTesting.ms_qty ?? 0))}" ${readonlyAttr}></label>
+        <label class="field"><span>${esc(p.name)} HSD testing qty</span><input name="testing_${p.id}_HSD" type="number" step="0.001" value="${esc(fieldValue(values, `testing_${p.id}_HSD`, savedTesting.hsd_qty ?? 0))}" ${readonlyAttr}></label>`;
+      }).join("")}
+      <label class="field span-2"><span>Notes</span><textarea name="notes" ${readonlyAttr}>${esc(fieldValue(values, "notes", currentDay?.notes || ""))}</textarea></label>
+      <div class="action-row">${currentDay ? '<a class="secondary link-button" href="/day/close">Close Day</a>' : ""}${editMode ? '<a class="secondary link-button" href="/day/start">Cancel Edit</a>' : ""}${lockedOpenDay ? "" : `<button class="primary" ${nozzles.length ? "" : "disabled"}>${editMode ? "Save Open Day" : "Start Day"}</button>`}</div>
     </form></section>
     ${currentDay ? `<section class="table-card"><div class="table-card-head"><div><h2>Open Day Readings</h2><p>${esc(currentDay.business_date)} is open. These are the pump readings captured at start.</p></div><span class="badge">${esc(currentDay.status)}</span></div>${table(currentRows)}</section>` : ""}
     <section class="table-card"><div class="table-card-head"><div><h2>Recent Day Records</h2><p>Started days stay visible here with date, rates and status.</p></div></div>${table(recentDays)}</section>`));
@@ -1610,6 +1623,10 @@ app.route("/day/start")
     const existingDay = await one("SELECT * FROM days WHERE business_date=?", [b.business_date]);
     if (existingDay && existingDay.status !== "Open") {
       return await renderDayStart(req, res, b, "This day is already closed.");
+    }
+    if (existingDay && req.query.edit !== "1") {
+      flash(req, "error", "Open day details are locked. Click Edit before making changes.");
+      return res.redirect("/day/start");
     }
     const nozzles = await all(
       `SELECT n.*, p.name pump
