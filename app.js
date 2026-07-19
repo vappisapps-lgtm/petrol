@@ -127,6 +127,14 @@ function initDb() {
       closing_meter REAL,
       UNIQUE(day_id, nozzle_id)
     );
+    CREATE TABLE IF NOT EXISTS day_pump_testing (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      day_id INTEGER NOT NULL REFERENCES days(id),
+      pump_id INTEGER NOT NULL REFERENCES pumps(id),
+      ms_qty REAL DEFAULT 0,
+      hsd_qty REAL DEFAULT 0,
+      UNIQUE(day_id, pump_id)
+    );
     CREATE TABLE IF NOT EXISTS shift_entries (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       day_id INTEGER NOT NULL REFERENCES days(id),
@@ -408,48 +416,24 @@ function adminResetConfig() {
   return null;
 }
 
-function ensurePumpNozzleSetup() {
-  const station = one("SELECT * FROM station WHERE id=1") || {};
-  const existingNozzles = Number(one("SELECT COUNT(*) c FROM nozzles WHERE status='Active'").c || 0);
-  const existingPumps = Number(one("SELECT COUNT(*) c FROM pumps WHERE status='Active'").c || 0);
-  const pumpCount = Math.max(Number(station.pumps_count || 0), existingPumps, existingNozzles ? 0 : 2);
-  if (!pumpCount) return;
-  const tankIds = {};
-  for (const product of PRODUCTS) {
-    let tank = one("SELECT * FROM tanks WHERE product=? AND status='Active' ORDER BY id LIMIT 1", [product]);
-    if (!tank) {
-      const created = run("INSERT INTO tanks(name, product, capacity, opening_dip, current_stock, status) VALUES(?,?,?,?,?,?)", [
-        `${product} Tank`,
-        product,
-        20000,
-        0,
-        0,
-        "Active",
-      ]);
-      tank = one("SELECT * FROM tanks WHERE id=?", [created.lastInsertRowid]);
-    }
-    tankIds[product] = tank.id;
-  }
-  for (let i = 1; i <= pumpCount; i += 1) {
-    const pumpName = `Pump ${i}`;
-    let pump = one("SELECT * FROM pumps WHERE name=?", [pumpName]);
-    if (!pump) {
-      const created = run("INSERT INTO pumps(name, status) VALUES(?,?)", [pumpName, "Active"]);
-      pump = one("SELECT * FROM pumps WHERE id=?", [created.lastInsertRowid]);
-    } else if (pump.status !== "Active") {
-      run("UPDATE pumps SET status='Active' WHERE id=?", [pump.id]);
-    }
-    for (const product of PRODUCTS) {
-      const exists = one("SELECT id FROM nozzles WHERE pump_id=? AND product=? AND status='Active'", [pump.id, product]);
-      if (!exists) {
-        run("INSERT INTO nozzles(pump_id, name, product, tank_id, status) VALUES(?,?,?,?,?)", [
-          pump.id,
-          `${pumpName} ${product}`,
-          product,
-          tankIds[product],
-          "Active",
-        ]);
-      }
+function cleanupGeneratedPumpSetup() {
+  const generated = all("SELECT * FROM pumps WHERE status='Active' AND name GLOB 'Pump [0-9]*' ORDER BY CAST(SUBSTR(name, 6) AS INTEGER)");
+  if (generated.length <= 2) return;
+  for (const pump of generated) {
+    const pumpNumber = Number(String(pump.name).replace("Pump ", ""));
+    if (!Number.isFinite(pumpNumber) || pumpNumber <= 2) continue;
+    const hasEntries = one(
+      `SELECT COUNT(*) c
+       FROM nozzles n
+       LEFT JOIN shift_entries se ON se.nozzle_id=n.id
+       LEFT JOIN day_nozzle_readings dnr ON dnr.nozzle_id=n.id
+       WHERE n.pump_id=? AND (se.id IS NOT NULL OR dnr.id IS NOT NULL)`,
+      [pump.id]
+    ).c;
+    const customNozzles = one("SELECT COUNT(*) c FROM nozzles WHERE pump_id=? AND name NOT IN (?,?)", [pump.id, `${pump.name} MS`, `${pump.name} HSD`]).c;
+    if (!Number(hasEntries) && !Number(customNozzles)) {
+      run("UPDATE nozzles SET status='Inactive' WHERE pump_id=?", [pump.id]);
+      run("UPDATE pumps SET status='Inactive' WHERE id=?", [pump.id]);
     }
   }
 }
@@ -578,7 +562,7 @@ function table(rows) {
   if (!rows.length) return `<div class="table-wrap"><table><thead><tr><th>Records</th></tr></thead><tbody><tr><td>No records yet.</td></tr></tbody></table></div>`;
   const keys = Object.keys(rows[0]);
   return `<div class="table-wrap"><table><thead><tr>${keys.map((k) => `<th>${esc(k.replaceAll("_", " "))}</th>`).join("")}</tr></thead><tbody>
-    ${rows.map((r) => `<tr>${keys.map((k) => `<td>${esc(r[k])}</td>`).join("")}</tr>`).join("")}
+    ${rows.map((r) => `<tr>${keys.map((k) => `<td>${k === "actions" ? r[k] : esc(r[k])}</td>`).join("")}</tr>`).join("")}
   </tbody></table></div>`;
 }
 
@@ -880,7 +864,9 @@ app.get("/master/:kind", requireLogin, requireRoles("admin", "manager"), (req, r
     customers: "SELECT * FROM customers ORDER BY name",
   };
   if (!queries[kind]) return res.status(404).send("Not found");
-  res.send(layout(req, `Master ${kind}`, `${pageHead(`Add New ${kind}`, `Setup > ${kind}`)}${masterForm(kind, all(queries[kind]))}`));
+  let rows = all(queries[kind]);
+  if (kind === "team") rows = rows.map((r) => ({ ...r, actions: `<a class="link-button secondary" href="/master/team/${esc(r.id)}/edit">Edit</a>` }));
+  res.send(layout(req, `Master ${kind}`, `${pageHead(`Add New ${kind}`, `Setup > ${kind}`)}${masterForm(kind, rows)}`));
 });
 
 app.post("/master/:kind", requireLogin, requireRoles("admin", "manager"), (req, res) => {
@@ -897,6 +883,56 @@ app.post("/master/:kind", requireLogin, requireRoles("admin", "manager"), (req, 
   res.redirect(`/master/${kind}`);
 });
 
+function renderTeamEdit(req, res, user, values = {}, error = "") {
+  const v = { ...user, ...values };
+  res.send(layout(req, "Edit Team Member", `${pageHead("Edit Team Member", "Setup > Team")}
+    <section class="form-card"><form method="post" class="grid-form">
+      ${inlineError(error)}
+      <label class="field"><span>Employee name</span><input name="name" value="${esc(fieldValue(v, "name", ""))}" required></label>
+      <label class="field"><span>Username / login ID</span><input name="mobile" value="${esc(fieldValue(v, "mobile", ""))}" required></label>
+      <label class="field"><span>Role</span><select name="role">${option("manager", "Manager", fieldValue(v, "role", ""))}${option("pump_boy", "Pump Boy / Team Member", fieldValue(v, "role", ""))}${option("admin", "Owner / Admin", fieldValue(v, "role", ""))}</select></label>
+      <label class="field"><span>New PIN / password</span><input name="password" type="password"><small>Leave blank to keep current password.</small></label>
+      <label class="field"><span>Assigned pumps</span><input name="assigned_pumps" value="${esc(fieldValue(v, "assigned_pumps", ""))}"></label>
+      <label class="field"><span>Status</span><select name="status">${option("Active", "Active", fieldValue(v, "status", ""))}${option("Inactive", "Inactive", fieldValue(v, "status", ""))}</select></label>
+      <div class="action-row"><a class="secondary link-button" href="/master/team">Cancel</a><button class="primary">Save Changes</button></div>
+    </form></section>`));
+}
+
+app.get("/master/team/:id/edit", requireLogin, requireRoles("admin", "manager"), (req, res) => {
+  const user = one("SELECT id, name, mobile, role, status, assigned_pumps FROM users WHERE id=?", [Number(req.params.id)]);
+  if (!user) return res.redirect("/master/team");
+  renderTeamEdit(req, res, user);
+});
+
+app.post("/master/team/:id/edit", requireLogin, requireRoles("admin", "manager"), (req, res) => {
+  const user = one("SELECT id, name, mobile, role, status, assigned_pumps FROM users WHERE id=?", [Number(req.params.id)]);
+  if (!user) return res.redirect("/master/team");
+  const b = req.body;
+  if (!b.name || !b.mobile) return renderTeamEdit(req, res, user, b, "Name and login ID are required.");
+  if (String(b.password || "").trim()) {
+    run("UPDATE users SET name=?, mobile=?, role=?, password_hash=?, status=?, assigned_pumps=? WHERE id=?", [
+      b.name,
+      b.mobile,
+      b.role,
+      hashWerkzeug(b.password),
+      b.status || "Active",
+      b.assigned_pumps || "",
+      user.id,
+    ]);
+  } else {
+    run("UPDATE users SET name=?, mobile=?, role=?, status=?, assigned_pumps=? WHERE id=?", [
+      b.name,
+      b.mobile,
+      b.role,
+      b.status || "Active",
+      b.assigned_pumps || "",
+      user.id,
+    ]);
+  }
+  flash(req, "success", "Team member updated.");
+  res.redirect("/master/team");
+});
+
 function dayOpeningRows(dayId) {
   return all(
     `SELECT d.business_date, p.name pump, n.name nozzle, n.product, dnr.opening_meter
@@ -911,15 +947,20 @@ function dayOpeningRows(dayId) {
 }
 
 function renderDayStart(req, res, values = {}, error = "") {
-  ensurePumpNozzleSetup();
+  cleanupGeneratedPumpSetup();
   const tanks = all("SELECT * FROM tanks WHERE status='Active' ORDER BY product, name");
   const nozzles = all(
     `SELECT n.*, p.name pump
      FROM nozzles n JOIN pumps p ON p.id=n.pump_id
      WHERE n.status='Active' AND p.status='Active'
-     ORDER BY p.name, n.product, n.name`
+     ORDER BY CASE WHEN p.name GLOB 'Pump [0-9]*' THEN CAST(SUBSTR(p.name, 6) AS INTEGER) ELSE 999999 END, p.name, n.product, n.name`
   );
-  const firstPumpName = nozzles[0]?.pump || "Pump 1";
+  const pumps = all(
+    `SELECT DISTINCT p.id, p.name
+     FROM pumps p JOIN nozzles n ON n.pump_id=p.id
+     WHERE p.status='Active' AND n.status='Active'
+     ORDER BY CASE WHEN p.name GLOB 'Pump [0-9]*' THEN CAST(SUBSTR(p.name, 6) AS INTEGER) ELSE 999999 END, p.name`
+  );
   const currentDay = activeDay();
   const currentRows = currentDay ? dayOpeningRows(currentDay.id) : [];
   const recentDays = all("SELECT id, business_date, ms_price, hsd_price, opening_cash, status FROM days ORDER BY business_date DESC LIMIT 10");
@@ -936,10 +977,11 @@ function renderDayStart(req, res, values = {}, error = "") {
         const suggested = lastMeter(n.id) ?? 0;
         return `<label class="field"><span>${esc(n.pump)} ${esc(n.product)} (${esc(n.name)})</span><input name="${name}" type="number" step="0.001" value="${esc(fieldValue(values, name, suggested))}" required></label>`;
       }).join("") || '<div class="form-error span-2">Add active pumps and nozzles before starting the day.</div>'}
-      <div class="form-section"><strong>${esc(firstPumpName)} testing</strong><small>Testing quantity is linked to the first pump.</small></div>
-      <label class="field"><span>${esc(firstPumpName)} testing done</span><select name="testing_done">${option("", "No", fieldValue(values, "testing_done", ""))}${option("1", "Yes", fieldValue(values, "testing_done", ""))}</select></label>
-      <label class="field"><span>${esc(firstPumpName)} MS testing qty</span><input name="testing_ms_qty" type="number" step="0.001" value="${esc(fieldValue(values, "testing_ms_qty", 0))}"></label>
-      <label class="field"><span>${esc(firstPumpName)} HSD testing qty</span><input name="testing_hsd_qty" type="number" step="0.001" value="${esc(fieldValue(values, "testing_hsd_qty", 0))}"></label>
+      <div class="form-section"><strong>Pump testing values</strong><small>Enter testing quantity for each configured pump.</small></div>
+      ${pumps.map((p) => `
+        <label class="field"><span>${esc(p.name)} MS testing qty</span><input name="testing_${p.id}_MS" type="number" step="0.001" value="${esc(fieldValue(values, `testing_${p.id}_MS`, 0))}"></label>
+        <label class="field"><span>${esc(p.name)} HSD testing qty</span><input name="testing_${p.id}_HSD" type="number" step="0.001" value="${esc(fieldValue(values, `testing_${p.id}_HSD`, 0))}"></label>
+      `).join("")}
       <label class="field span-2"><span>Notes</span><textarea name="notes">${esc(fieldValue(values, "notes", ""))}</textarea></label>
       <div class="action-row"><button class="primary" ${nozzles.length ? "" : "disabled"}>Start Day</button></div>
     </form></section>
@@ -960,7 +1002,7 @@ app.route("/day/start")
       `SELECT n.*, p.name pump
        FROM nozzles n JOIN pumps p ON p.id=n.pump_id
        WHERE n.status='Active' AND p.status='Active'
-       ORDER BY p.name, n.product, n.name`
+       ORDER BY CASE WHEN p.name GLOB 'Pump [0-9]*' THEN CAST(SUBSTR(p.name, 6) AS INTEGER) ELSE 999999 END, p.name, n.product, n.name`
     );
     if (!nozzles.length) return renderDayStart(req, res, b, "Add active pumps and nozzles before starting the day.");
     for (const nozzle of nozzles) {
@@ -969,13 +1011,26 @@ app.route("/day/start")
         return renderDayStart(req, res, b, `Enter opening meter for ${nozzle.pump} ${nozzle.product}.`);
       }
     }
-    const testingDone = b.testing_done ? 1 : 0;
+    const pumps = all(
+      `SELECT DISTINCT p.id, p.name
+       FROM pumps p JOIN nozzles n ON n.pump_id=p.id
+       WHERE p.status='Active' AND n.status='Active'
+       ORDER BY CASE WHEN p.name GLOB 'Pump [0-9]*' THEN CAST(SUBSTR(p.name, 6) AS INTEGER) ELSE 999999 END, p.name`
+    );
+    const pumpTesting = pumps.map((p) => ({
+      pump_id: p.id,
+      ms_qty: litres(b[`testing_${p.id}_MS`] || 0),
+      hsd_qty: litres(b[`testing_${p.id}_HSD`] || 0),
+    }));
+    const totalTestingMs = pumpTesting.reduce((a, p) => a + p.ms_qty, 0);
+    const totalTestingHsd = pumpTesting.reduce((a, p) => a + p.hsd_qty, 0);
+    const testingDone = totalTestingMs > 0 || totalTestingHsd > 0 ? 1 : 0;
     const openingMs = all("SELECT current_stock FROM tanks WHERE product='MS' AND status='Active'").reduce((a, t) => a + Number(t.current_stock || 0), 0);
     const openingHsd = all("SELECT current_stock FROM tanks WHERE product='HSD' AND status='Active'").reduce((a, t) => a + Number(t.current_stock || 0), 0);
     const result = run(
       `INSERT INTO days(business_date, ms_price, hsd_price, opening_ms, opening_hsd, testing_done, testing_ms_qty, testing_hsd_qty, opening_cash, notes)
        VALUES(?,?,?,?,?,?,?,?,?,?)`,
-      [b.business_date, Number(b.ms_price), Number(b.hsd_price), openingMs, openingHsd, testingDone, testingDone ? Number(b.testing_ms_qty || 0) : 0, testingDone ? Number(b.testing_hsd_qty || 0) : 0, Number(b.opening_cash || 0), b.notes || ""]
+      [b.business_date, Number(b.ms_price), Number(b.hsd_price), openingMs, openingHsd, testingDone, totalTestingMs, totalTestingHsd, Number(b.opening_cash || 0), b.notes || ""]
     );
     for (const tank of all("SELECT * FROM tanks WHERE status='Active'")) {
       const opening = Number(tank.current_stock || 0);
@@ -985,27 +1040,30 @@ app.route("/day/start")
     for (const nozzle of nozzles) {
       run("INSERT INTO day_nozzle_readings(day_id, nozzle_id, opening_meter) VALUES(?,?,?)", [result.lastInsertRowid, nozzle.id, Number(b[`nozzle_${nozzle.id}_opening`])]);
     }
-    if (testingDone && Number(b.testing_ms_qty || 0) > 0) run("UPDATE tanks SET current_stock=current_stock-? WHERE id=(SELECT id FROM tanks WHERE product='MS' AND status='Active' ORDER BY current_stock DESC LIMIT 1)", [Number(b.testing_ms_qty || 0)]);
-    if (testingDone && Number(b.testing_hsd_qty || 0) > 0) run("UPDATE tanks SET current_stock=current_stock-? WHERE id=(SELECT id FROM tanks WHERE product='HSD' AND status='Active' ORDER BY current_stock DESC LIMIT 1)", [Number(b.testing_hsd_qty || 0)]);
+    for (const p of pumpTesting) {
+      if (p.ms_qty || p.hsd_qty) run("INSERT INTO day_pump_testing(day_id, pump_id, ms_qty, hsd_qty) VALUES(?,?,?,?)", [result.lastInsertRowid, p.pump_id, p.ms_qty, p.hsd_qty]);
+    }
+    if (testingDone && totalTestingMs > 0) run("UPDATE tanks SET current_stock=current_stock-? WHERE id=(SELECT id FROM tanks WHERE product='MS' AND status='Active' ORDER BY current_stock DESC LIMIT 1)", [totalTestingMs]);
+    if (testingDone && totalTestingHsd > 0) run("UPDATE tanks SET current_stock=current_stock-? WHERE id=(SELECT id FROM tanks WHERE product='HSD' AND status='Active' ORDER BY current_stock DESC LIMIT 1)", [totalTestingHsd]);
     flash(req, "success", "Day started. Shift entries are now available.");
     res.redirect("/day/start");
   });
 
 function renderShiftStart(req, res, values = {}, error = "") {
-  ensurePumpNozzleSetup();
+  cleanupGeneratedPumpSetup();
   const day = activeDay();
   if (!day) {
     flash(req, "error", "Start a business day before opening shifts.");
     return res.redirect("/day/start");
   }
-  const pumps = all("SELECT * FROM pumps WHERE status='Active' ORDER BY name");
+  const pumps = all("SELECT * FROM pumps WHERE status='Active' ORDER BY CASE WHEN name GLOB 'Pump [0-9]*' THEN CAST(SUBSTR(name, 6) AS INTEGER) ELSE 999999 END, name");
   const users = all("SELECT * FROM users WHERE status='Active' AND role IN ('manager','pump_boy') ORDER BY name");
   const shifts = all("SELECT * FROM shift_defs WHERE status='Active' ORDER BY start_time");
   const nozzles = all(
     `SELECT n.*, p.name pump
      FROM nozzles n JOIN pumps p ON p.id=n.pump_id
      WHERE n.status='Active' AND p.status='Active'
-     ORDER BY p.name, n.product, n.name`
+     ORDER BY CASE WHEN p.name GLOB 'Pump [0-9]*' THEN CAST(SUBSTR(p.name, 6) AS INTEGER) ELSE 999999 END, p.name, n.product, n.name`
   );
   const openEntries = all(
     `SELECT p.name pump, n.name nozzle, se.product, u.name user_name, se.opening_meter, se.status
@@ -1054,7 +1112,7 @@ app.route("/shift/start")
     if (!shift) {
       return renderShiftStart(req, res, req.body, "Add at least one active shift definition before starting a shift.");
     }
-    const nozzles = all("SELECT * FROM nozzles WHERE pump_id=? AND status='Active' ORDER BY product", [pumpId]);
+    const nozzles = all("SELECT * FROM nozzles WHERE pump_id=? AND status='Active' ORDER BY product, name", [pumpId]);
     if (!nozzles.length) {
       return renderShiftStart(req, res, req.body, "Selected pump has no active nozzles.");
     }
