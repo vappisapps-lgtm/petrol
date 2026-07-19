@@ -119,6 +119,14 @@ function initDb() {
       closing_dip REAL,
       UNIQUE(day_id, tank_id)
     );
+    CREATE TABLE IF NOT EXISTS day_nozzle_readings (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      day_id INTEGER NOT NULL REFERENCES days(id),
+      nozzle_id INTEGER NOT NULL REFERENCES nozzles(id),
+      opening_meter REAL NOT NULL DEFAULT 0,
+      closing_meter REAL,
+      UNIQUE(day_id, nozzle_id)
+    );
     CREATE TABLE IF NOT EXISTS shift_entries (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       day_id INTEGER NOT NULL REFERENCES days(id),
@@ -212,6 +220,16 @@ function initDb() {
       db.exec(sql);
     } catch (_err) {}
   }
+  db.exec(`
+    INSERT OR IGNORE INTO day_nozzle_readings(day_id, nozzle_id, opening_meter)
+    SELECT se.day_id, se.nozzle_id, se.opening_meter
+    FROM shift_entries se
+    JOIN (
+      SELECT day_id, nozzle_id, MIN(id) first_entry_id
+      FROM shift_entries
+      GROUP BY day_id, nozzle_id
+    ) firsts ON firsts.first_entry_id=se.id
+  `);
   persistDb();
 }
 
@@ -310,6 +328,19 @@ function lastMeter(nozzleId) {
     [nozzleId]
   );
   return row ? Number(row.closing_meter) : null;
+}
+
+function dayOpeningMeter(dayId, nozzleId) {
+  const row = one("SELECT opening_meter FROM day_nozzle_readings WHERE day_id=? AND nozzle_id=?", [dayId, nozzleId]);
+  return row ? Number(row.opening_meter) : null;
+}
+
+function fieldValue(values, name, fallback = "") {
+  return values && Object.prototype.hasOwnProperty.call(values, name) ? values[name] : fallback;
+}
+
+function inlineError(message) {
+  return message ? `<div class="form-error span-2">${esc(message)}</div>` : "";
 }
 
 function detectShift(timeStr) {
@@ -591,6 +622,17 @@ app.get("/", requireLogin, (req, res) => {
     );
   }
   const m = metrics;
+  const openingRows = dayOpeningRows(m.day.id);
+  const openEntries = all(
+    `SELECT se.business_date, p.name pump, n.name nozzle, se.product, u.name user_name, se.opening_meter, se.status
+     FROM shift_entries se
+     JOIN users u ON u.id=se.user_id
+     JOIN nozzles n ON n.id=se.nozzle_id
+     JOIN pumps p ON p.id=n.pump_id
+     WHERE se.day_id=? AND se.status='Open'
+     ORDER BY p.name, n.product, n.name`,
+    [m.day.id]
+  );
   res.send(
     layout(
       req,
@@ -614,6 +656,8 @@ app.get("/", requireLogin, (req, res) => {
         <div class="panel"><div class="panel-title"><h2>Stock Available</h2></div>${m.tank_stock.map((r) => `<div class="ledger-line"><span>${esc(r.product)}</span><strong>${ltr(r.stock)}</strong></div>`).join("")}</div>
         <div class="panel"><div class="panel-title"><h2>Pump-wise Sales</h2></div>${m.pump_sales.map((r) => `<div class="ledger-line"><span>${esc(r.pump)}</span><strong>${rs(r.sales)}</strong></div>`).join("") || '<p class="muted">No pump sales yet.</p>'}</div>
         <div class="panel"><div class="panel-title"><h2>Top Credit Customers</h2></div>${m.top_customers.map((c) => `<div class="ledger-line"><span>${esc(c.name)}</span><strong>${rs(c.balance)}</strong></div>`).join("") || '<p class="muted">No pending customer credit.</p>'}</div>
+        <div class="panel wide"><div class="panel-title"><h2>Day Opening Readings</h2><span class="badge">${esc(m.day.business_date)}</span></div>${table(openingRows)}</div>
+        <div class="panel wide"><div class="panel-title"><h2>Open Shift Records</h2><span class="badge">${esc(m.open_shifts)} open</span></div>${table(openEntries)}</div>
         <div class="panel wide"><div class="panel-title"><h2>Boy-wise Sales</h2></div>${table(m.boy_sales)}</div>
       </section>`
     )
@@ -729,33 +773,81 @@ app.post("/master/:kind", requireLogin, requireRoles("admin", "manager"), (req, 
   res.redirect(`/master/${kind}`);
 });
 
+function dayOpeningRows(dayId) {
+  return all(
+    `SELECT d.business_date, p.name pump, n.name nozzle, n.product, dnr.opening_meter
+     FROM day_nozzle_readings dnr
+     JOIN days d ON d.id=dnr.day_id
+     JOIN nozzles n ON n.id=dnr.nozzle_id
+     JOIN pumps p ON p.id=n.pump_id
+     WHERE d.id=?
+     ORDER BY p.name, n.product, n.name`,
+    [dayId]
+  );
+}
+
+function renderDayStart(req, res, values = {}, error = "") {
+  const tanks = all("SELECT * FROM tanks WHERE status='Active' ORDER BY product, name");
+  const nozzles = all(
+    `SELECT n.*, p.name pump
+     FROM nozzles n JOIN pumps p ON p.id=n.pump_id
+     WHERE n.status='Active' AND p.status='Active'
+     ORDER BY p.name, n.product, n.name`
+  );
+  const lastDay = one("SELECT * FROM days WHERE status='Closed' ORDER BY business_date DESC LIMIT 1");
+  const suggestedMs = lastDay?.actual_ms ?? tanks.filter((t) => t.product === "MS").reduce((a, t) => a + Number(t.current_stock || 0), 0);
+  const suggestedHsd = lastDay?.actual_hsd ?? tanks.filter((t) => t.product === "HSD").reduce((a, t) => a + Number(t.current_stock || 0), 0);
+  const currentDay = activeDay();
+  const currentRows = currentDay ? dayOpeningRows(currentDay.id) : [];
+  const recentDays = all("SELECT id, business_date, ms_price, hsd_price, opening_cash, status FROM days ORDER BY business_date DESC LIMIT 10");
+  res.send(layout(req, "Day Start", `${pageHead("Start Business Day", "Operations > Day Start")}
+    <section class="form-card"><form method="post" class="grid-form">
+      ${inlineError(error)}
+      <label class="field"><span>Business date</span><input name="business_date" type="date" value="${esc(fieldValue(values, "business_date", todayIso()))}" required></label>
+      <label class="field"><span>Opening cash</span><input name="opening_cash" type="number" step="0.01" value="${esc(fieldValue(values, "opening_cash", ""))}"></label>
+      <label class="field"><span>MS price</span><input name="ms_price" type="number" step="0.01" value="${esc(fieldValue(values, "ms_price", ""))}" required></label>
+      <label class="field"><span>HSD price</span><input name="hsd_price" type="number" step="0.01" value="${esc(fieldValue(values, "hsd_price", ""))}" required></label>
+      <label class="field"><span>Opening MS stock</span><input name="opening_ms" type="number" step="0.001" value="${esc(fieldValue(values, "opening_ms", suggestedMs))}"></label>
+      <label class="field"><span>Opening HSD stock</span><input name="opening_hsd" type="number" step="0.001" value="${esc(fieldValue(values, "opening_hsd", suggestedHsd))}"></label>
+      <label class="field"><span>Testing done</span><select name="testing_done">${option("", "No", fieldValue(values, "testing_done", ""))}${option("1", "Yes", fieldValue(values, "testing_done", ""))}</select></label>
+      <label class="field"><span>MS testing qty</span><input name="testing_ms_qty" type="number" step="0.001" value="${esc(fieldValue(values, "testing_ms_qty", 0))}"></label>
+      <label class="field"><span>HSD testing qty</span><input name="testing_hsd_qty" type="number" step="0.001" value="${esc(fieldValue(values, "testing_hsd_qty", 0))}"></label>
+      <div class="form-section"><strong>Tank opening dips</strong><small>Physical stock at day start</small></div>
+      ${tanks.map((t) => `<label class="field"><span>${esc(t.name)} opening dip</span><input name="tank_${t.id}_opening" type="number" step="0.001" value="${esc(fieldValue(values, `tank_${t.id}_opening`, t.current_stock || 0))}"></label>`).join("")}
+      <div class="form-section"><strong>Pump opening meter readings</strong><small>Saved by nozzle for shift start</small></div>
+      ${nozzles.map((n) => {
+        const name = `nozzle_${n.id}_opening`;
+        const suggested = lastMeter(n.id) ?? 0;
+        return `<label class="field"><span>${esc(n.pump)} ${esc(n.product)} (${esc(n.name)})</span><input name="${name}" type="number" step="0.001" value="${esc(fieldValue(values, name, suggested))}" required></label>`;
+      }).join("") || '<div class="form-error span-2">Add active pumps and nozzles before starting the day.</div>'}
+      <label class="field span-2"><span>Notes</span><textarea name="notes">${esc(fieldValue(values, "notes", ""))}</textarea></label>
+      <div class="action-row"><button class="primary" ${nozzles.length ? "" : "disabled"}>Start Day</button></div>
+    </form></section>
+    ${currentDay ? `<section class="table-card"><div class="table-card-head"><div><h2>Open Day Readings</h2><p>${esc(currentDay.business_date)} is open. These are the pump readings captured at start.</p></div><span class="badge">${esc(currentDay.status)}</span></div>${table(currentRows)}</section>` : ""}
+    <section class="table-card"><div class="table-card-head"><div><h2>Recent Day Records</h2><p>Started days stay visible here with date, rates, cash and status.</p></div></div>${table(recentDays)}</section>`));
+}
+
 app.route("/day/start")
   .get(requireLogin, requireRoles("admin", "manager"), (req, res) => {
-    const tanks = all("SELECT * FROM tanks WHERE status='Active' ORDER BY product, name");
-    const lastDay = one("SELECT * FROM days WHERE status='Closed' ORDER BY business_date DESC LIMIT 1");
-    const suggestedMs = lastDay?.actual_ms ?? tanks.filter((t) => t.product === "MS").reduce((a, t) => a + Number(t.current_stock || 0), 0);
-    const suggestedHsd = lastDay?.actual_hsd ?? tanks.filter((t) => t.product === "HSD").reduce((a, t) => a + Number(t.current_stock || 0), 0);
-    res.send(layout(req, "Day Start", `${pageHead("Start Business Day", "Operations > Day Start")}
-      <section class="form-card"><form method="post" class="grid-form">
-        <label class="field"><span>Business date</span><input name="business_date" type="date" value="${todayIso()}" required></label>
-        <label class="field"><span>Opening cash</span><input name="opening_cash" type="number" step="0.01"></label>
-        <label class="field"><span>MS price</span><input name="ms_price" type="number" step="0.01" required></label>
-        <label class="field"><span>HSD price</span><input name="hsd_price" type="number" step="0.01" required></label>
-        <label class="field"><span>Opening MS</span><input name="opening_ms" type="number" step="0.001" value="${esc(suggestedMs)}"></label>
-        <label class="field"><span>Opening HSD</span><input name="opening_hsd" type="number" step="0.001" value="${esc(suggestedHsd)}"></label>
-        <label class="field"><span>Testing done</span><select name="testing_done">${option("", "No")}${option("1", "Yes")}</select></label>
-        <label class="field"><span>MS testing qty</span><input name="testing_ms_qty" type="number" step="0.001" value="0"></label>
-        <label class="field"><span>HSD testing qty</span><input name="testing_hsd_qty" type="number" step="0.001" value="0"></label>
-        ${tanks.map((t) => `<label class="field"><span>${esc(t.name)} opening dip</span><input name="tank_${t.id}_opening" type="number" step="0.001" value="${esc(t.current_stock || 0)}"></label>`).join("")}
-        <label class="field span-2"><span>Notes</span><textarea name="notes"></textarea></label>
-        <div class="action-row"><button class="primary">Start Day</button></div>
-      </form></section>`));
+    renderDayStart(req, res);
   })
   .post(requireLogin, requireRoles("admin", "manager"), (req, res) => {
     const b = req.body;
     if (one("SELECT id FROM days WHERE business_date=?", [b.business_date])) {
-      flash(req, "error", "A day is already started for this date.");
-      return res.redirect("/day/start");
+      return renderDayStart(req, res, b, "A day is already started for this date.");
+    }
+    const nozzles = all(
+      `SELECT n.*, p.name pump
+       FROM nozzles n JOIN pumps p ON p.id=n.pump_id
+       WHERE n.status='Active' AND p.status='Active'
+       ORDER BY p.name, n.product, n.name`
+    );
+    if (!nozzles.length) return renderDayStart(req, res, b, "Add active pumps and nozzles before starting the day.");
+    for (const nozzle of nozzles) {
+      const value = b[`nozzle_${nozzle.id}_opening`];
+      if (value === "" || value == null || Number.isNaN(Number(value))) {
+        return renderDayStart(req, res, b, `Enter opening meter for ${nozzle.pump} ${nozzle.product}.`);
+      }
     }
     const testingDone = b.testing_done ? 1 : 0;
     const result = run(
@@ -768,45 +860,88 @@ app.route("/day/start")
       run("INSERT INTO tank_readings(day_id, tank_id, opening_dip) VALUES(?,?,?)", [result.lastInsertRowid, tank.id, opening]);
       run("UPDATE tanks SET current_stock=?, opening_dip=? WHERE id=?", [opening, opening, tank.id]);
     }
+    for (const nozzle of nozzles) {
+      run("INSERT INTO day_nozzle_readings(day_id, nozzle_id, opening_meter) VALUES(?,?,?)", [result.lastInsertRowid, nozzle.id, Number(b[`nozzle_${nozzle.id}_opening`])]);
+    }
     if (testingDone && Number(b.testing_ms_qty || 0) > 0) run("UPDATE tanks SET current_stock=current_stock-? WHERE id=(SELECT id FROM tanks WHERE product='MS' AND status='Active' ORDER BY current_stock DESC LIMIT 1)", [Number(b.testing_ms_qty || 0)]);
     if (testingDone && Number(b.testing_hsd_qty || 0) > 0) run("UPDATE tanks SET current_stock=current_stock-? WHERE id=(SELECT id FROM tanks WHERE product='HSD' AND status='Active' ORDER BY current_stock DESC LIMIT 1)", [Number(b.testing_hsd_qty || 0)]);
     flash(req, "success", "Day started. Shift entries are now available.");
-    res.redirect("/");
+    res.redirect("/day/start");
   });
+
+function renderShiftStart(req, res, values = {}, error = "") {
+  const day = activeDay();
+  if (!day) {
+    flash(req, "error", "Start a business day before opening shifts.");
+    return res.redirect("/day/start");
+  }
+  const pumps = all("SELECT * FROM pumps WHERE status='Active' ORDER BY name");
+  const users = all("SELECT * FROM users WHERE status='Active' AND role IN ('manager','pump_boy') ORDER BY name");
+  const shifts = all("SELECT * FROM shift_defs WHERE status='Active' ORDER BY start_time");
+  const nozzles = all(
+    `SELECT n.*, p.name pump
+     FROM nozzles n JOIN pumps p ON p.id=n.pump_id
+     WHERE n.status='Active' AND p.status='Active'
+     ORDER BY p.name, n.product, n.name`
+  );
+  const openEntries = all(
+    `SELECT p.name pump, n.name nozzle, se.product, u.name user_name, se.opening_meter, se.status
+     FROM shift_entries se
+     JOIN users u ON u.id=se.user_id
+     JOIN nozzles n ON n.id=se.nozzle_id
+     JOIN pumps p ON p.id=n.pump_id
+     WHERE se.day_id=? AND se.status='Open'
+     ORDER BY p.name, n.product, n.name`,
+    [day.id]
+  );
+  res.send(layout(req, "Start Shift", `${pageHead("Start Shift", "Operations > Start Shift")}
+    <section class="form-card"><form method="post" class="grid-form">
+      ${inlineError(error)}
+      <label class="field"><span>Pump</span><select name="pump_id">${pumps.map((p) => option(p.id, p.name, fieldValue(values, "pump_id", pumps[0]?.id || ""))).join("")}</select></label>
+      <label class="field"><span>Team member</span><select name="user_id">${users.map((u) => option(u.id, u.name, fieldValue(values, "user_id", req.user.id))).join("")}</select></label>
+      <label class="field"><span>Time in</span><input name="time_in" type="time" value="${esc(fieldValue(values, "time_in", new Date().toTimeString().slice(0, 5)))}"></label>
+      <label class="field"><span>Detected shift</span><select name="shift_def_id"><option value="">Auto by time</option>${shifts.map((s) => option(s.id, `${s.name} (${s.start_time}-${s.end_time})`, fieldValue(values, "shift_def_id", ""))).join("")}</select></label>
+      <div class="form-section"><strong>Opening meters</strong><small>Defaults come from the day-start pump readings</small></div>
+      ${nozzles.map((n) => {
+        const name = `opening_meter_${n.id}`;
+        const suggested = dayOpeningMeter(day.id, n.id) ?? lastMeter(n.id) ?? 0;
+        return `<label class="field"><span>${esc(n.pump)} ${esc(n.product)} (${esc(n.name)})</span><input name="${name}" type="number" step="0.001" value="${esc(fieldValue(values, name, suggested))}"></label>`;
+      }).join("") || '<div class="form-error span-2">Add active pumps and nozzles before starting shifts.</div>'}
+      <div class="action-row"><button class="primary" ${pumps.length && users.length && shifts.length && nozzles.length ? "" : "disabled"}>Start Shift</button></div>
+    </form></section>
+    <section class="table-card"><div class="table-card-head"><div><h2>Open Shift Records</h2><p>${esc(day.business_date)} active shift records.</p></div></div>${table(openEntries)}</section>`));
+}
 
 app.route("/shift/start")
   .get(requireLogin, (req, res) => {
-    const day = activeDay();
-    if (!day) {
-      flash(req, "error", "Start a business day before opening shifts.");
-      return res.redirect("/day/start");
-    }
-    const pumps = all("SELECT * FROM pumps WHERE status='Active' ORDER BY name");
-    const users = all("SELECT * FROM users WHERE status='Active' AND role IN ('manager','pump_boy') ORDER BY name");
-    res.send(layout(req, "Start Shift", `${pageHead("Start Shift", "Operations > Start Shift")}
-      <section class="form-card"><form method="post" class="grid-form">
-        <label class="field"><span>Pump</span><select name="pump_id">${pumps.map((p) => option(p.id, p.name)).join("")}</select></label>
-        <label class="field"><span>Team member</span><select name="user_id">${users.map((u) => option(u.id, u.name, req.user.id)).join("")}</select></label>
-        <label class="field"><span>Time in</span><input name="time_in" type="time" value="${new Date().toTimeString().slice(0, 5)}"></label>
-        <label class="field"><span>Opening meter MS</span><input name="opening_meter_MS" type="number" step="0.001" placeholder="Auto from last close if blank"></label>
-        <label class="field"><span>Opening meter HSD</span><input name="opening_meter_HSD" type="number" step="0.001" placeholder="Auto from last close if blank"></label>
-        <div class="action-row"><button class="primary">Start Shift</button></div>
-      </form></section>`));
+    renderShiftStart(req, res);
   })
   .post(requireLogin, (req, res) => {
     const day = activeDay();
     if (!day) return res.redirect("/day/start");
     const pumpId = Number(req.body.pump_id);
     const userId = req.user.role === "pump_boy" ? req.user.id : Number(req.body.user_id || req.user.id);
-    const shift = detectShift(req.body.time_in);
+    const shift = req.body.shift_def_id ? one("SELECT * FROM shift_defs WHERE id=? AND status='Active'", [Number(req.body.shift_def_id)]) : detectShift(req.body.time_in);
+    if (!pumpId || !one("SELECT id FROM pumps WHERE id=? AND status='Active'", [pumpId])) {
+      return renderShiftStart(req, res, req.body, "Select an active pump.");
+    }
+    if (!userId || !one("SELECT id FROM users WHERE id=? AND status='Active'", [userId])) {
+      return renderShiftStart(req, res, req.body, "Select an active team member.");
+    }
+    if (!shift) {
+      return renderShiftStart(req, res, req.body, "Add at least one active shift definition before starting a shift.");
+    }
     const nozzles = all("SELECT * FROM nozzles WHERE pump_id=? AND status='Active' ORDER BY product", [pumpId]);
+    if (!nozzles.length) {
+      return renderShiftStart(req, res, req.body, "Selected pump has no active nozzles.");
+    }
     let created = 0;
     for (const nozzle of nozzles) {
-      let opening = req.body[`opening_meter_${nozzle.product}`];
+      let opening = req.body[`opening_meter_${nozzle.id}`];
+      if (opening === "" || opening == null) opening = dayOpeningMeter(day.id, nozzle.id);
       if (opening === "" || opening == null) opening = lastMeter(nozzle.id);
       if (opening == null) {
-        flash(req, "error", `Enter opening meter for ${nozzle.product} nozzle.`);
-        return res.redirect("/shift/start");
+        return renderShiftStart(req, res, req.body, `Enter opening meter for ${nozzle.product} nozzle.`);
       }
       if (one("SELECT id FROM shift_entries WHERE nozzle_id=? AND status='Open'", [nozzle.id])) continue;
       run(
@@ -816,7 +951,8 @@ app.route("/shift/start")
       );
       created += 1;
     }
-    flash(req, created ? "success" : "warning", created ? `Shift started for ${created} nozzle(s).` : "No shift created. Nozzle may already be open.");
+    if (!created) return renderShiftStart(req, res, req.body, "No shift created. The selected pump nozzles may already be open.");
+    flash(req, "success", `Shift started for ${created} nozzle(s).`);
     res.redirect("/shifts/active");
   });
 
@@ -833,47 +969,51 @@ app.get("/shifts/active", requireLogin, (req, res) => {
   res.send(layout(req, "Active Shifts", `${pageHead("Active Shifts", "Operations > Active Shifts", '<a class="primary link-button" href="/shift/close">Close Shift</a>')}${table(entries)}`));
 });
 
+function renderShiftClose(req, res, values = {}, error = "") {
+  const where = req.user.role === "pump_boy" ? "AND se.user_id=?" : "";
+  const params = req.user.role === "pump_boy" ? [req.user.id] : [];
+  const openEntries = all(
+    `SELECT se.*, u.name user_name, p.name pump, n.name nozzle
+     FROM shift_entries se JOIN users u ON u.id=se.user_id JOIN nozzles n ON n.id=se.nozzle_id JOIN pumps p ON p.id=n.pump_id
+     WHERE se.status='Open' ${where} ORDER BY se.opened_at DESC`,
+    params
+  );
+  const customers = all("SELECT * FROM customers WHERE status='Active' ORDER BY name");
+  const selectedId = fieldValue(values, "shift_entry_id", req.query.id || "");
+  res.send(layout(req, "Close Shift", `${pageHead("Close Shift", "Operations > Close Shift")}
+    <section class="form-card"><form method="post" class="grid-form">
+      ${inlineError(error)}
+      <label class="field span-2"><span>Open shift</span><select name="shift_entry_id">${openEntries.map((e) => option(e.id, `${e.business_date} - ${e.pump} / ${e.nozzle} - ${e.user_name} - ${e.product}`, selectedId)).join("")}</select></label>
+      <label class="field"><span>Closing meter</span><input name="closing_meter" type="number" step="0.001" value="${esc(fieldValue(values, "closing_meter", ""))}" required></label>
+      <label class="field"><span>Testing done</span><select name="testing_done">${option("", "No", fieldValue(values, "testing_done", ""))}${option("1", "Yes", fieldValue(values, "testing_done", ""))}</select></label>
+      <label class="field"><span>Testing qty</span><input name="testing_qty" type="number" step="0.001" value="${esc(fieldValue(values, "testing_qty", 0))}"></label>
+      <label class="field"><span>Cash</span><input name="cash" type="number" step="0.01" value="${esc(fieldValue(values, "cash", 0))}"></label>
+      <label class="field"><span>UPI</span><input name="upi" type="number" step="0.01" value="${esc(fieldValue(values, "upi", 0))}"></label>
+      <label class="field"><span>Card</span><input name="card" type="number" step="0.01" value="${esc(fieldValue(values, "card", 0))}"></label>
+      <label class="field"><span>Credit</span><input name="credit" type="number" step="0.01" value="${esc(fieldValue(values, "credit", 0))}"></label>
+      <label class="field"><span>Credit customer</span><select name="customer_id"><option value="">None</option>${customers.map((c) => option(c.id, c.name, fieldValue(values, "customer_id", ""))).join("")}</select></label>
+      <label class="field"><span>Expenses</span><input name="expenses" type="number" step="0.01" value="${esc(fieldValue(values, "expenses", 0))}"></label>
+      <label class="field"><span>Expense category</span><select name="expense_category">${DEFAULT_EXPENSE_CATEGORIES.map((c) => option(c, c, fieldValue(values, "expense_category", "Miscellaneous"))).join("")}</select></label>
+      <label class="field"><span>Beta</span><input name="beta" type="number" step="0.01" value="${esc(fieldValue(values, "beta", 0))}"></label>
+      <label class="field"><span>Miscellaneous</span><input name="miscellaneous" type="number" step="0.01" value="${esc(fieldValue(values, "miscellaneous", 0))}"></label>
+      <label class="field span-2"><span>Remarks</span><textarea name="remarks">${esc(fieldValue(values, "remarks", ""))}</textarea></label>
+      <div class="action-row"><button class="primary" ${openEntries.length ? "" : "disabled"}>Close Shift</button></div>
+    </form></section>${table(openEntries)}`));
+}
+
 app.route("/shift/close")
   .get(requireLogin, (req, res) => {
-    const where = req.user.role === "pump_boy" ? "AND se.user_id=?" : "";
-    const params = req.user.role === "pump_boy" ? [req.user.id] : [];
-    const openEntries = all(
-      `SELECT se.*, u.name user_name, p.name pump, n.name nozzle
-       FROM shift_entries se JOIN users u ON u.id=se.user_id JOIN nozzles n ON n.id=se.nozzle_id JOIN pumps p ON p.id=n.pump_id
-       WHERE se.status='Open' ${where} ORDER BY se.opened_at DESC`,
-      params
-    );
-    const customers = all("SELECT * FROM customers WHERE status='Active' ORDER BY name");
-    res.send(layout(req, "Close Shift", `${pageHead("Close Shift", "Operations > Close Shift")}
-      <section class="form-card"><form method="post" class="grid-form">
-        <label class="field span-2"><span>Open shift</span><select name="shift_entry_id">${openEntries.map((e) => option(e.id, `${e.business_date} - ${e.pump} / ${e.nozzle} - ${e.user_name} - ${e.product}`, req.query.id)).join("")}</select></label>
-        <label class="field"><span>Closing meter</span><input name="closing_meter" type="number" step="0.001" required></label>
-        <label class="field"><span>Testing done</span><select name="testing_done">${option("", "No")}${option("1", "Yes")}</select></label>
-        <label class="field"><span>Testing qty</span><input name="testing_qty" type="number" step="0.001" value="0"></label>
-        <label class="field"><span>Cash</span><input name="cash" type="number" step="0.01" value="0"></label>
-        <label class="field"><span>UPI</span><input name="upi" type="number" step="0.01" value="0"></label>
-        <label class="field"><span>Card</span><input name="card" type="number" step="0.01" value="0"></label>
-        <label class="field"><span>Credit</span><input name="credit" type="number" step="0.01" value="0"></label>
-        <label class="field"><span>Credit customer</span><select name="customer_id"><option value="">None</option>${customers.map((c) => option(c.id, c.name)).join("")}</select></label>
-        <label class="field"><span>Expenses</span><input name="expenses" type="number" step="0.01" value="0"></label>
-        <label class="field"><span>Expense category</span><select name="expense_category">${DEFAULT_EXPENSE_CATEGORIES.map((c) => option(c)).join("")}</select></label>
-        <label class="field"><span>Beta</span><input name="beta" type="number" step="0.01" value="0"></label>
-        <label class="field"><span>Miscellaneous</span><input name="miscellaneous" type="number" step="0.01" value="0"></label>
-        <label class="field span-2"><span>Remarks</span><textarea name="remarks"></textarea></label>
-        <div class="action-row"><button class="primary">Close Shift</button></div>
-      </form></section>${table(openEntries)}`));
+    renderShiftClose(req, res);
   })
   .post(requireLogin, (req, res) => {
     const se = one("SELECT * FROM shift_entries WHERE id=? AND status='Open'", [Number(req.body.shift_entry_id)]);
     if (!se) {
-      flash(req, "error", "Open shift not found.");
-      return res.redirect("/shift/close");
+      return renderShiftClose(req, res, req.body, "Open shift not found.");
     }
     if (req.user.role === "pump_boy" && se.user_id !== req.user.id) return res.status(403).send("Forbidden");
     const closing = Number(req.body.closing_meter);
     if (closing < Number(se.opening_meter)) {
-      flash(req, "error", "Closing reading cannot be less than opening reading.");
-      return res.redirect(`/shift/close?id=${se.id}`);
+      return renderShiftClose(req, res, req.body, "Closing reading cannot be less than opening reading.");
     }
     const pmts = getShiftPaymentsTotal(se.id);
     const testingQty = req.body.testing_done ? litres(req.body.testing_qty) : 0;
@@ -889,8 +1029,7 @@ app.route("/shift/close")
     const shortage = money(cash + upi + card + credit + expenses + beta + misc - amount);
     const customerId = req.body.customer_id || null;
     if (credit > 0 && !customerId && Number(pmts.credit) === 0) {
-      flash(req, "error", "Select a credit customer for credit sale.");
-      return res.redirect(`/shift/close?id=${se.id}`);
+      return renderShiftClose(req, res, req.body, "Select a credit customer for credit sale.");
     }
     run(
       `UPDATE shift_entries SET closing_meter=?, litres_sold=?, sales_amount=?, cash=?, upi=?, card=?, credit=?,

@@ -33,6 +33,9 @@ a { color: inherit; text-decoration: none; }
   position: fixed;
   inset: 0 auto 0 0;
   width: 260px;
+  max-height: 100vh;
+  overflow-y: auto;
+  overscroll-behavior: contain;
   background: #fbfcfb;
   padding: 22px 18px;
   border-right: 1px solid var(--line);
@@ -383,6 +386,7 @@ tr:hover td { background: #fbfcfb; }
 .flash { padding: 12px 14px; border-radius: 8px; background: #eaf7ed; border: 1px solid #c8ead1; }
 .flash.error { background: var(--red); border-color: #ffc8c8; }
 .flash.warning { background: var(--yellow); border-color: #ffe0a1; }
+.form-error { padding: 12px 14px; border-radius: 8px; background: var(--red); border: 1px solid #ffc8c8; color: #6e1717; font-weight: 800; }
 .subhead { font-weight: 900; padding-top: 8px; }
 
 @media print {
