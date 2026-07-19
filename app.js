@@ -34,7 +34,7 @@ let dbInitialized = false;
 
 const PRODUCTS = ["MS", "HSD"];
 const DEFAULT_EXPENSE_CATEGORIES = ["Tea", "Cleaning", "Maintenance", "Staff advance", "Miscellaneous"];
-const PAYMENT_TYPES = ["Cash", "Phone Pay", "Card", "Credit", "Personal", "Others"];
+const PAYMENT_TYPES = ["Cash", "Phone Pay", "Credit", "Miscellaneous", "Beta"];
 const USING_MYSQL = DB_DIALECT === "mysql";
 const MIGRATION_TABLES = [
   "station",
@@ -690,10 +690,9 @@ async function getShiftPaymentsTotal(entryId) {
     `SELECT
      COALESCE(SUM(CASE WHEN payment_type='Cash' THEN amount ELSE cash END),0) cash,
      COALESCE(SUM(CASE WHEN payment_type='Phone Pay' THEN amount ELSE upi END),0) upi,
-     COALESCE(SUM(CASE WHEN payment_type='Card' THEN amount ELSE card END),0) card,
      COALESCE(SUM(CASE WHEN payment_type='Credit' THEN amount ELSE credit END),0) credit,
-     COALESCE(SUM(CASE WHEN payment_type='Personal' THEN amount ELSE 0 END),0) personal,
-     COALESCE(SUM(CASE WHEN payment_type='Others' THEN amount ELSE 0 END),0) others,
+     COALESCE(SUM(CASE WHEN payment_type='Miscellaneous' THEN amount ELSE 0 END),0) miscellaneous,
+     COALESCE(SUM(CASE WHEN payment_type='Beta' THEN amount ELSE 0 END),0) beta,
      COALESCE(SUM(CASE WHEN amount > 0 THEN amount ELSE cash+upi+card+credit END),0) total
      FROM shift_payments WHERE shift_entry_id=?`,
     [entryId]
@@ -703,7 +702,6 @@ async function getShiftPaymentsTotal(entryId) {
 function paymentColumn(paymentType) {
   if (paymentType === "Cash") return "cash";
   if (paymentType === "Phone Pay") return "upi";
-  if (paymentType === "Card") return "card";
   if (paymentType === "Credit") return "credit";
   return null;
 }
@@ -712,10 +710,12 @@ async function getPumpPaymentRows(pumpId, req) {
   const where = req.user.role === "pump_boy" ? "AND se.user_id=?" : "";
   const params = req.user.role === "pump_boy" ? [pumpId, req.user.id] : [pumpId];
   return await all(
-    `SELECT sp.recorded_at time, sp.product, sp.payment_type, sp.amount, sp.note, c.name customer
+    `SELECT sp.recorded_at time, p.name pump, u.name salesperson, sp.payment_type, sp.amount, sp.note, c.name customer
      FROM shift_payments sp
      JOIN shift_entries se ON se.id=sp.shift_entry_id
+     JOIN users u ON u.id=se.user_id
      JOIN nozzles n ON n.id=se.nozzle_id
+     JOIN pumps p ON p.id=n.pump_id
      LEFT JOIN customers c ON c.id=sp.customer_id
      WHERE n.pump_id=? AND se.status='Open' ${where}
      ORDER BY sp.recorded_at DESC, sp.id DESC`,
@@ -725,18 +725,60 @@ async function getPumpPaymentRows(pumpId, req) {
 
 async function getPumpPaymentTotals(pumpId, req) {
   const rows = await getPumpPaymentRows(pumpId, req);
-  const totals = { cash: 0, phone_pay: 0, card: 0, credit: 0, personal: 0, others: 0, total: 0 };
+  const totals = { cash: 0, phone_pay: 0, credit: 0, miscellaneous: 0, beta: 0, total: 0 };
   for (const row of rows) {
     const amount = money(row.amount);
     if (row.payment_type === "Cash") totals.cash = money(totals.cash + amount);
     if (row.payment_type === "Phone Pay") totals.phone_pay = money(totals.phone_pay + amount);
-    if (row.payment_type === "Card") totals.card = money(totals.card + amount);
     if (row.payment_type === "Credit") totals.credit = money(totals.credit + amount);
-    if (row.payment_type === "Personal") totals.personal = money(totals.personal + amount);
-    if (row.payment_type === "Others") totals.others = money(totals.others + amount);
+    if (row.payment_type === "Miscellaneous") totals.miscellaneous = money(totals.miscellaneous + amount);
+    if (row.payment_type === "Beta") totals.beta = money(totals.beta + amount);
     totals.total = money(totals.total + amount);
   }
   return totals;
+}
+
+async function previousClosedDay(beforeDate = null) {
+  const params = beforeDate ? [beforeDate] : [];
+  return await one(
+    `SELECT * FROM days WHERE status='Closed' ${beforeDate ? "AND business_date < ?" : ""}
+     ORDER BY business_date DESC, id DESC LIMIT 1`,
+    params
+  );
+}
+
+async function previousClosedMeter(nozzleId, beforeDate = null) {
+  const day = await previousClosedDay(beforeDate);
+  if (!day) return null;
+  const row = await one("SELECT closing_meter FROM day_nozzle_readings WHERE day_id=? AND nozzle_id=?", [day.id, nozzleId]);
+  return row && row.closing_meter != null ? Number(row.closing_meter) : null;
+}
+
+async function saveDayNozzleReading(dayId, nozzleId, openingMeter, closingMeter = undefined) {
+  const existing = await one("SELECT id FROM day_nozzle_readings WHERE day_id=? AND nozzle_id=?", [dayId, nozzleId]);
+  if (existing) {
+    if (closingMeter === undefined) {
+      await run("UPDATE day_nozzle_readings SET opening_meter=? WHERE id=?", [openingMeter, existing.id]);
+    } else {
+      await run("UPDATE day_nozzle_readings SET opening_meter=?, closing_meter=? WHERE id=?", [openingMeter, closingMeter, existing.id]);
+    }
+    return;
+  }
+  await run("INSERT INTO day_nozzle_readings(day_id, nozzle_id, opening_meter, closing_meter) VALUES(?,?,?,?)", [
+    dayId,
+    nozzleId,
+    openingMeter,
+    closingMeter === undefined ? null : closingMeter,
+  ]);
+}
+
+async function saveDayPumpTesting(dayId, pumpId, msQty, hsdQty) {
+  const existing = await one("SELECT id FROM day_pump_testing WHERE day_id=? AND pump_id=?", [dayId, pumpId]);
+  if (existing) {
+    await run("UPDATE day_pump_testing SET ms_qty=?, hsd_qty=? WHERE id=?", [msQty, hsdQty, existing.id]);
+    return;
+  }
+  await run("INSERT INTO day_pump_testing(day_id, pump_id, ms_qty, hsd_qty) VALUES(?,?,?,?)", [dayId, pumpId, msQty, hsdQty]);
 }
 
 async function decrementLargestTank(product, quantity) {
@@ -942,7 +984,14 @@ async function dashboardMetrics() {
   return {
     day,
     totals,
-    open_shifts: (await one("SELECT COUNT(*) c FROM shift_entries WHERE day_id=? AND status='Open'", [day.id])).c,
+    open_shifts: (await one(
+      `SELECT COUNT(DISTINCT p.id) c
+       FROM shift_entries se
+       JOIN nozzles n ON n.id=se.nozzle_id
+       JOIN pumps p ON p.id=n.pump_id
+       WHERE se.day_id=? AND se.status='Open'`,
+      [day.id]
+    )).c,
     tank_stock: await all("SELECT product, COALESCE(SUM(current_stock),0) stock FROM tanks GROUP BY product"),
     credit_pending: (await one("SELECT COALESCE(SUM(balance),0) b FROM customers WHERE status='Active'")).b,
     top_customers: await all("SELECT name, balance FROM customers WHERE balance>0 ORDER BY balance DESC LIMIT 5"),
@@ -1065,6 +1114,12 @@ function table(rows) {
   const keys = Object.keys(rows[0]);
   return `<div class="table-wrap"><table><thead><tr>${keys.map((k) => `<th>${esc(k.replaceAll("_", " "))}</th>`).join("")}</tr></thead><tbody>
     ${rows.map((r) => `<tr>${keys.map((k) => `<td>${k === "actions" ? r[k] : esc(r[k])}</td>`).join("")}</tr>`).join("")}
+  </tbody></table></div>`;
+}
+
+function tableColumns(rows, keys) {
+  return `<div class="table-wrap"><table><thead><tr>${keys.map((k) => `<th>${esc(k.replaceAll("_", " "))}</th>`).join("")}</tr></thead><tbody>
+    ${rows.length ? rows.map((r) => `<tr>${keys.map((k) => `<td>${k === "actions" ? r[k] : esc(r[k] ?? "")}</td>`).join("")}</tr>`).join("") : `<tr><td colspan="${keys.length}">No records yet.</td></tr>`}
   </tbody></table></div>`;
 }
 
@@ -1269,8 +1324,8 @@ app.get("/", requireLogin, async (req, res) => {
   }
   const m = metrics;
   const openingRows = await dayOpeningRows(m.day.id);
-  const openEntries = await all(
-    `SELECT se.business_date, p.name pump, se.product, u.name user_name, se.opening_meter, se.status
+  const openEntries = groupPumpEntries(await all(
+    `SELECT se.business_date, p.id pump_id, p.name pump, se.product, u.name user_name, se.opening_meter, se.status
      FROM shift_entries se
      JOIN users u ON u.id=se.user_id
      JOIN nozzles n ON n.id=se.nozzle_id
@@ -1278,7 +1333,7 @@ app.get("/", requireLogin, async (req, res) => {
      WHERE se.day_id=? AND se.status='Open'
      ORDER BY p.name, n.product, n.name`,
     [m.day.id]
-  );
+  ));
   res.send(
     layout(
       req,
@@ -1287,7 +1342,7 @@ app.get("/", requireLogin, async (req, res) => {
       <section class="stat-grid">
         <div class="stat hero"><span>Today sales</span><strong>${rs(m.totals.sales)}</strong><small>${esc(m.day.business_date)}</small></div>
         <div class="stat"><span>Cash</span><strong>${rs(m.totals.cash)}</strong><small>Opening ${rs(m.day.opening_cash)}</small></div>
-        <div class="stat"><span>UPI / Card</span><strong>${rs(Number(m.totals.upi) + Number(m.totals.card))}</strong><small>Digital collections</small></div>
+        <div class="stat"><span>Phone Pay</span><strong>${rs(m.totals.upi)}</strong><small>Digital collections</small></div>
         <div class="stat"><span>Credit pending</span><strong>${rs(m.credit_pending)}</strong><small>${esc(m.open_shifts)} open shifts</small></div>
       </section>
       <section class="dashboard-grid">
@@ -1304,8 +1359,8 @@ app.get("/", requireLogin, async (req, res) => {
         <div class="panel"><div class="panel-title"><h2>Payment Split</h2></div>${m.payment_totals.map((r) => `<div class="ledger-line"><span>${esc(r.payment_type || "Unsorted")}</span><strong>${rs(r.amount)}</strong></div>`).join("") || '<p class="muted">No shift payments logged yet.</p>'}</div>
         <div class="panel"><div class="panel-title"><h2>Top Credit Customers</h2></div>${m.top_customers.map((c) => `<div class="ledger-line"><span>${esc(c.name)}</span><strong>${rs(c.balance)}</strong></div>`).join("") || '<p class="muted">No pending customer credit.</p>'}</div>
         <div class="panel wide"><div class="panel-title"><h2>Day Opening Readings</h2><span class="badge">${esc(m.day.business_date)}</span></div>${table(openingRows)}</div>
-        <div class="panel wide"><div class="panel-title"><h2>Open Shift Records</h2><span class="badge">${esc(m.open_shifts)} open</span></div>${table(openEntries)}</div>
-        <div class="panel wide"><div class="panel-title"><h2>Boy-wise Sales</h2></div>${table(m.boy_sales)}</div>
+        <div class="panel wide"><div class="panel-title"><h2>Open Shift Records</h2><span class="badge">${esc(m.open_shifts)} open</span></div>${tableColumns(openEntries, ["business_date", "pump", "user_name", "ms_opening", "hsd_opening", "status"])}</div>
+        <div class="panel wide"><div class="panel-title"><h2>Salesperson-wise Sales</h2></div>${tableColumns(m.boy_sales, ["name", "sales", "litres"])}</div>
       </section>`
     )
   );
@@ -1489,7 +1544,6 @@ async function dayOpeningRows(dayId) {
 
 async function renderDayStart(req, res, values = {}, error = "") {
   await ensureConfiguredPumpProducts();
-  const tanks = await all("SELECT * FROM tanks WHERE status='Active' ORDER BY product, name");
   const nozzles = await all(
     `SELECT n.*, p.name pump
      FROM nozzles n JOIN pumps p ON p.id=n.pump_id
@@ -1502,19 +1556,27 @@ async function renderDayStart(req, res, values = {}, error = "") {
      WHERE p.status='Active' AND n.status='Active'
      ORDER BY CASE WHEN p.name GLOB 'Pump [0-9]*' THEN CAST(SUBSTR(p.name, 6) AS INTEGER) ELSE 999999 END, p.name`
   );
-  for (const nozzle of nozzles) {
-    nozzle.suggested_opening = (await lastMeter(nozzle.id)) ?? 0;
-  }
   const currentDay = await activeDay();
+  const selectedDate = fieldValue(values, "business_date", currentDay?.business_date || todayIso());
+  const editingOpenDay = Boolean(currentDay);
+  for (const nozzle of nozzles) {
+    const currentOpening = currentDay ? await dayOpeningMeter(currentDay.id, nozzle.id) : null;
+    const previousOpening = await previousClosedMeter(nozzle.id, selectedDate);
+    nozzle.suggested_opening = currentOpening ?? previousOpening ?? 0;
+    nozzle.readonly_opening = !currentDay && previousOpening != null;
+  }
   const currentRows = currentDay ? await dayOpeningRows(currentDay.id) : [];
-  const recentDays = await all("SELECT id, business_date, ms_price, hsd_price, opening_cash, status FROM days ORDER BY business_date DESC LIMIT 10");
+  const recentDays = (await all("SELECT id, business_date, ms_price, hsd_price, status FROM days ORDER BY business_date DESC LIMIT 10")).map((d) => ({
+    ...d,
+    actions: d.status === "Open" ? '<a class="link-button secondary" href="/day/close">Close day</a>' : "",
+  }));
   res.send(layout(req, "Day Start", `${pageHead("Start Business Day", "Operations > Day Start")}
     <section class="form-card"><form method="post" class="grid-form">
       ${inlineError(error)}
-      <label class="field"><span>Business date / sales date</span><input name="business_date" type="date" value="${esc(fieldValue(values, "business_date", todayIso()))}" required><small>Opening readings are previous closing readings carried into this date.</small></label>
-      <label class="field"><span>Opening cash</span><input name="opening_cash" type="number" step="0.01" value="${esc(fieldValue(values, "opening_cash", ""))}"></label>
-      <label class="field"><span>MS price</span><input name="ms_price" type="number" step="0.01" value="${esc(fieldValue(values, "ms_price", ""))}" required></label>
-      <label class="field"><span>HSD price</span><input name="hsd_price" type="number" step="0.01" value="${esc(fieldValue(values, "hsd_price", ""))}" required></label>
+      ${editingOpenDay ? '<div class="flash warning span-2">A business day is already open. Save changes here or close the day before starting another.</div>' : ""}
+      <label class="field"><span>Business date / sales date</span><input name="business_date" type="date" value="${esc(selectedDate)}" ${editingOpenDay ? "readonly" : ""} required><small>Opening readings come only from the previous closed day.</small></label>
+      <label class="field"><span>MS price</span><input name="ms_price" type="number" step="0.01" value="${esc(fieldValue(values, "ms_price", currentDay?.ms_price || ""))}" required></label>
+      <label class="field"><span>HSD price</span><input name="hsd_price" type="number" step="0.01" value="${esc(fieldValue(values, "hsd_price", currentDay?.hsd_price || ""))}" required></label>
       <div class="form-section"><strong>Pump opening meter readings</strong><small>Previous closing readings for this business date.</small></div>
       ${pumps.map((p) => {
         const pumpMeters = nozzles
@@ -1522,7 +1584,7 @@ async function renderDayStart(req, res, values = {}, error = "") {
           .map((n) => {
             const name = `meter_${n.id}_opening`;
             const suggested = n.suggested_opening;
-            return `<label class="field"><span>${esc(n.product)}</span><input name="${name}" type="number" step="0.001" value="${esc(fieldValue(values, name, suggested))}" required></label>`;
+            return `<label class="field"><span>${esc(n.product)}</span><input name="${name}" type="number" step="0.001" value="${esc(fieldValue(values, name, suggested))}" ${n.readonly_opening ? "readonly" : ""} required>${n.readonly_opening ? '<small>Auto-filled from previous closed day. Edit after saving if correction is needed.</small>' : ""}</label>`;
           })
           .join("");
         return `<div class="form-section"><strong>${esc(p.name)}</strong><small>Opening meter readings</small></div>${pumpMeters}`;
@@ -1533,10 +1595,10 @@ async function renderDayStart(req, res, values = {}, error = "") {
         <label class="field"><span>${esc(p.name)} HSD testing qty</span><input name="testing_${p.id}_HSD" type="number" step="0.001" value="${esc(fieldValue(values, `testing_${p.id}_HSD`, 0))}"></label>
       `).join("")}
       <label class="field span-2"><span>Notes</span><textarea name="notes">${esc(fieldValue(values, "notes", ""))}</textarea></label>
-      <div class="action-row"><button class="primary" ${nozzles.length ? "" : "disabled"}>Start Day</button></div>
+      <div class="action-row">${currentDay ? '<a class="secondary link-button" href="/day/close">Close Day</a>' : ""}<button class="primary" ${nozzles.length ? "" : "disabled"}>${editingOpenDay ? "Save Open Day" : "Start Day"}</button></div>
     </form></section>
     ${currentDay ? `<section class="table-card"><div class="table-card-head"><div><h2>Open Day Readings</h2><p>${esc(currentDay.business_date)} is open. These are the pump readings captured at start.</p></div><span class="badge">${esc(currentDay.status)}</span></div>${table(currentRows)}</section>` : ""}
-    <section class="table-card"><div class="table-card-head"><div><h2>Recent Day Records</h2><p>Started days stay visible here with date, rates, cash and status.</p></div></div>${table(recentDays)}</section>`));
+    <section class="table-card"><div class="table-card-head"><div><h2>Recent Day Records</h2><p>Started days stay visible here with date, rates and status.</p></div></div>${table(recentDays)}</section>`));
 }
 
 app.route("/day/start")
@@ -1545,8 +1607,9 @@ app.route("/day/start")
   })
   .post(requireLogin, requireRoles("admin", "manager"), async (req, res) => {
     const b = req.body;
-    if (await one("SELECT id FROM days WHERE business_date=?", [b.business_date])) {
-      return await renderDayStart(req, res, b, "A day is already started for this date.");
+    const existingDay = await one("SELECT * FROM days WHERE business_date=?", [b.business_date]);
+    if (existingDay && existingDay.status !== "Open") {
+      return await renderDayStart(req, res, b, "This day is already closed.");
     }
     const nozzles = await all(
       `SELECT n.*, p.name pump
@@ -1575,27 +1638,37 @@ app.route("/day/start")
     const totalTestingMs = pumpTesting.reduce((a, p) => a + p.ms_qty, 0);
     const totalTestingHsd = pumpTesting.reduce((a, p) => a + p.hsd_qty, 0);
     const testingDone = totalTestingMs > 0 || totalTestingHsd > 0 ? 1 : 0;
-    const openingMs = (await all("SELECT current_stock FROM tanks WHERE product='MS' AND status='Active'")).reduce((a, t) => a + Number(t.current_stock || 0), 0);
-    const openingHsd = (await all("SELECT current_stock FROM tanks WHERE product='HSD' AND status='Active'")).reduce((a, t) => a + Number(t.current_stock || 0), 0);
-    const result = await run(
-      `INSERT INTO days(business_date, ms_price, hsd_price, opening_ms, opening_hsd, testing_done, testing_ms_qty, testing_hsd_qty, opening_cash, notes)
-       VALUES(?,?,?,?,?,?,?,?,?,?)`,
-      [b.business_date, Number(b.ms_price), Number(b.hsd_price), openingMs, openingHsd, testingDone, totalTestingMs, totalTestingHsd, Number(b.opening_cash || 0), b.notes || ""]
-    );
-    for (const tank of await all("SELECT * FROM tanks WHERE status='Active'")) {
-      const opening = Number(tank.current_stock || 0);
-      await run("INSERT INTO tank_readings(day_id, tank_id, opening_dip) VALUES(?,?,?)", [result.lastInsertRowid, tank.id, opening]);
-      await run("UPDATE tanks SET opening_dip=? WHERE id=?", [opening, tank.id]);
+    const openingMs = nozzles.filter((n) => n.product === "MS").reduce((a, n) => a + Number(b[`meter_${n.id}_opening`] || 0), 0);
+    const openingHsd = nozzles.filter((n) => n.product === "HSD").reduce((a, n) => a + Number(b[`meter_${n.id}_opening`] || 0), 0);
+    let dayId = existingDay?.id;
+    if (existingDay) {
+      await run(
+        `UPDATE days SET ms_price=?, hsd_price=?, opening_ms=?, opening_hsd=?, testing_done=?,
+         testing_ms_qty=?, testing_hsd_qty=?, notes=? WHERE id=?`,
+        [Number(b.ms_price), Number(b.hsd_price), openingMs, openingHsd, testingDone, totalTestingMs, totalTestingHsd, b.notes || "", dayId]
+      );
+    } else {
+      const result = await run(
+        `INSERT INTO days(business_date, ms_price, hsd_price, opening_ms, opening_hsd, testing_done, testing_ms_qty, testing_hsd_qty, opening_cash, notes)
+         VALUES(?,?,?,?,?,?,?,?,?,?)`,
+        [b.business_date, Number(b.ms_price), Number(b.hsd_price), openingMs, openingHsd, testingDone, totalTestingMs, totalTestingHsd, 0, b.notes || ""]
+      );
+      dayId = result.lastInsertRowid;
+      for (const tank of await all("SELECT * FROM tanks WHERE status='Active'")) {
+        const opening = Number(tank.current_stock || 0);
+        await run("INSERT INTO tank_readings(day_id, tank_id, opening_dip) VALUES(?,?,?)", [dayId, tank.id, opening]);
+        await run("UPDATE tanks SET opening_dip=? WHERE id=?", [opening, tank.id]);
+      }
     }
     for (const nozzle of nozzles) {
-      await run("INSERT INTO day_nozzle_readings(day_id, nozzle_id, opening_meter) VALUES(?,?,?)", [result.lastInsertRowid, nozzle.id, Number(b[`meter_${nozzle.id}_opening`] ?? b[`nozzle_${nozzle.id}_opening`])]);
+      await saveDayNozzleReading(dayId, nozzle.id, Number(b[`meter_${nozzle.id}_opening`] ?? b[`nozzle_${nozzle.id}_opening`]));
     }
     for (const p of pumpTesting) {
-      if (p.ms_qty || p.hsd_qty) await run("INSERT INTO day_pump_testing(day_id, pump_id, ms_qty, hsd_qty) VALUES(?,?,?,?)", [result.lastInsertRowid, p.pump_id, p.ms_qty, p.hsd_qty]);
+      await saveDayPumpTesting(dayId, p.pump_id, p.ms_qty, p.hsd_qty);
     }
-    if (testingDone && totalTestingMs > 0) await decrementLargestTank("MS", totalTestingMs);
-    if (testingDone && totalTestingHsd > 0) await decrementLargestTank("HSD", totalTestingHsd);
-    flash(req, "success", "Day started. Shift entries are now available.");
+    if (!existingDay && testingDone && totalTestingMs > 0) await decrementLargestTank("MS", totalTestingMs);
+    if (!existingDay && testingDone && totalTestingHsd > 0) await decrementLargestTank("HSD", totalTestingHsd);
+    flash(req, "success", existingDay ? "Open day updated." : "Day started. Shift entries are now available.");
     res.redirect("/day/start");
   });
 
@@ -1724,33 +1797,42 @@ app.get("/shifts/active", requireLogin, async (req, res) => {
     ...r,
     actions: `<a class="link-button secondary" href="/shift/pump/${esc(r.pump_id)}/payment">Payments</a> <a class="link-button secondary" href="/shift/pump/${esc(r.pump_id)}/edit">Edit</a>`,
   }));
-  res.send(layout(req, "Active Shifts", `${pageHead("Active Shifts", "Operations > Active Shifts", '<a class="primary link-button" href="/shift/close">Close Shift</a>')}${table(entries)}`));
+  res.send(layout(req, "Active Shifts", `${pageHead("Active Shifts", "Operations > Active Shifts", '<a class="primary link-button" href="/shift/close">Close Shift</a>')}${tableColumns(entries, ["business_date", "pump", "user_name", "shift_name", "ms_opening", "hsd_opening", "ms_closing", "hsd_closing", "status", "actions"])}`));
 });
 
 async function renderPumpPayments(req, res, pump, entries, values = {}, error = "") {
   const customers = await all("SELECT * FROM customers WHERE status='Active' ORDER BY name");
   const paymentRows = await getPumpPaymentRows(pump.id, req);
   const totals = await getPumpPaymentTotals(pump.id, req);
+  const assigned = entries[0]?.user_name || "";
   res.send(layout(req, "Shift Payments", `${pageHead(`${pump.name} Payments`, "Operations > Active Pump")}
     <section class="form-card"><form method="post" class="grid-form">
       ${inlineError(error)}
-      <label class="field"><span>Product</span><select name="product">${entries.map((e) => option(e.product, e.product, fieldValue(values, "product", ""))).join("")}</select></label>
+      <label class="field"><span>Pump</span><input value="${esc(pump.name)}" readonly></label>
+      <label class="field"><span>Salesperson</span><input value="${esc(assigned)}" readonly></label>
       <label class="field"><span>Payment type</span><select name="payment_type">${PAYMENT_TYPES.map((p) => option(p, p, fieldValue(values, "payment_type", ""))).join("")}</select></label>
       <label class="field"><span>Amount</span><input name="amount" type="number" step="0.01" value="${esc(fieldValue(values, "amount", ""))}" required></label>
       <label class="field"><span>Time</span><input name="recorded_at" type="time" value="${esc(fieldValue(values, "recorded_at", new Date().toTimeString().slice(0, 5)))}"></label>
-      <label class="field"><span>Credit customer</span><select name="customer_id"><option value="">None</option>${customers.map((c) => option(c.id, c.name, fieldValue(values, "customer_id", ""))).join("")}</select><small>Needed only for Credit.</small></label>
+      <label class="field" id="creditCustomerField"><span>Credit customer</span><select name="customer_id"><option value="">None</option>${customers.map((c) => option(c.id, c.name, fieldValue(values, "customer_id", ""))).join("")}</select><small>Needed only for Credit.</small></label>
       <label class="field"><span>Note</span><input name="note" value="${esc(fieldValue(values, "note", ""))}"></label>
       <div class="action-row"><a class="secondary link-button" href="/shifts/active">Back</a><button class="primary">Add Payment</button></div>
+      <script>
+        const paymentTypeSelect = document.querySelector('select[name="payment_type"]');
+        const creditCustomerField = document.getElementById('creditCustomerField');
+        function toggleCreditCustomer(){ creditCustomerField.style.display = paymentTypeSelect.value === 'Credit' ? '' : 'none'; }
+        paymentTypeSelect.addEventListener('change', toggleCreditCustomer);
+        toggleCreditCustomer();
+      </script>
     </form></section>
     <section class="stat-grid">
       <div class="stat"><span>Cash</span><strong>${rs(totals.cash)}</strong></div>
       <div class="stat"><span>Phone Pay</span><strong>${rs(totals.phone_pay)}</strong></div>
-      <div class="stat"><span>Card</span><strong>${rs(totals.card)}</strong></div>
       <div class="stat"><span>Credit</span><strong>${rs(totals.credit)}</strong></div>
-      <div class="stat"><span>Personal / Others</span><strong>${rs(Number(totals.personal) + Number(totals.others))}</strong></div>
+      <div class="stat"><span>Miscellaneous</span><strong>${rs(totals.miscellaneous)}</strong></div>
+      <div class="stat"><span>Beta</span><strong>${rs(totals.beta)}</strong></div>
       <div class="stat hero"><span>Total logged</span><strong>${rs(totals.total)}</strong></div>
     </section>
-    <section class="table-card"><div class="table-card-head"><div><h2>Payment Log</h2><p>Each payment is timestamped and linked to MS or HSD for this active pump.</p></div></div>${table(paymentRows)}</section>`));
+    <section class="table-card"><div class="table-card-head"><div><h2>Payment Log</h2><p>Each payment is timestamped and linked to this active pump.</p></div></div>${tableColumns(paymentRows, ["time", "pump", "salesperson", "payment_type", "amount", "customer", "note"])}</section>`));
 }
 
 app.get("/shift/pump/:pumpId/payment", requireLogin, async (req, res) => {
@@ -1759,8 +1841,9 @@ app.get("/shift/pump/:pumpId/payment", requireLogin, async (req, res) => {
   const where = req.user.role === "pump_boy" ? "AND se.user_id=?" : "";
   const params = req.user.role === "pump_boy" ? [pump.id, req.user.id] : [pump.id];
   const entries = await all(
-    `SELECT se.id, se.product, se.business_date
+    `SELECT se.id, se.product, se.business_date, u.name user_name
      FROM shift_entries se JOIN nozzles n ON n.id=se.nozzle_id
+     JOIN users u ON u.id=se.user_id
      WHERE n.pump_id=? AND se.status='Open' ${where}
      ORDER BY se.product`,
     params
@@ -1775,18 +1858,17 @@ app.post("/shift/pump/:pumpId/payment", requireLogin, async (req, res) => {
   const where = req.user.role === "pump_boy" ? "AND se.user_id=?" : "";
   const params = req.user.role === "pump_boy" ? [pump.id, req.user.id] : [pump.id];
   const entries = await all(
-    `SELECT se.id, se.product, se.business_date
+    `SELECT se.id, se.product, se.business_date, u.name user_name
      FROM shift_entries se JOIN nozzles n ON n.id=se.nozzle_id
+     JOIN users u ON u.id=se.user_id
      WHERE n.pump_id=? AND se.status='Open' ${where}
      ORDER BY se.product`,
     params
   );
   if (!entries.length) return res.redirect("/shifts/active");
-  const product = String(req.body.product || "").trim();
   const paymentType = String(req.body.payment_type || "").trim();
   const amount = money(req.body.amount);
-  const entry = entries.find((e) => e.product === product);
-  if (!entry) return await renderPumpPayments(req, res, pump, entries, req.body, "Select MS or HSD for this payment.");
+  const entry = entries[0];
   if (!PAYMENT_TYPES.includes(paymentType)) return await renderPumpPayments(req, res, pump, entries, req.body, "Select a valid payment type.");
   if (!amount || amount <= 0) return await renderPumpPayments(req, res, pump, entries, req.body, "Enter payment amount.");
   if (paymentType === "Credit" && !req.body.customer_id) return await renderPumpPayments(req, res, pump, entries, req.body, "Select credit customer for Credit payment.");
@@ -1800,7 +1882,7 @@ app.post("/shift/pump/:pumpId/payment", requireLogin, async (req, res) => {
      VALUES(?,?,?,?,?,?,?,?,?,?${recordedAt ? ", ?" : ""})`,
     [
       entry.id,
-      product,
+      null,
       paymentType,
       amount,
       values.cash,
@@ -1816,10 +1898,10 @@ app.post("/shift/pump/:pumpId/payment", requireLogin, async (req, res) => {
     await run("UPDATE customers SET balance=balance+? WHERE id=?", [amount, Number(req.body.customer_id)]);
     await run(
       "INSERT INTO credit_ledger(customer_id, business_date, entry_type, product, amount, pump_nozzle, shift_entry_id, notes) VALUES(?,?,?,?,?,?,?,?)",
-      [Number(req.body.customer_id), businessDate, "credit", product, amount, pump.name, entry.id, req.body.note || "Shift credit logged"]
+      [Number(req.body.customer_id), businessDate, "credit", null, amount, pump.name, entry.id, req.body.note || "Shift credit logged"]
     );
   }
-  flash(req, "success", `${paymentType} payment added for ${product}.`);
+  flash(req, "success", `${paymentType} payment added for ${pump.name}.`);
   res.redirect(`/shift/pump/${pump.id}/payment`);
 });
 
@@ -1885,40 +1967,37 @@ app.post("/shift/pump/:pumpId/edit", requireLogin, async (req, res) => {
 
 async function renderShiftClose(req, res, values = {}, error = "") {
   const openPumps = await activePumpGroups(req);
-  const customers = await all("SELECT * FROM customers WHERE status='Active' ORDER BY name");
   const selectedPumpId = Number(fieldValue(values, "pump_id", req.query.pump_id || openPumps[0]?.pump_id || ""));
   const selectedPump = openPumps.find((p) => Number(p.pump_id) === selectedPumpId);
-  const loggedTotals = selectedPump ? await getPumpPaymentTotals(selectedPumpId, req) : { cash: 0, phone_pay: 0, card: 0, credit: 0, personal: 0, others: 0, total: 0 };
+  const loggedTotals = selectedPump ? await getPumpPaymentTotals(selectedPumpId, req) : { cash: 0, phone_pay: 0, credit: 0, miscellaneous: 0, beta: 0, total: 0 };
+  const paymentRows = selectedPump ? await getPumpPaymentRows(selectedPumpId, req) : [];
   res.send(layout(req, "Close Shift", `${pageHead("Close Shift", "Operations > Close Shift")}
     <section class="stat-grid">
       <div class="stat"><span>Logged cash</span><strong>${rs(loggedTotals.cash)}</strong></div>
       <div class="stat"><span>Logged phone pay</span><strong>${rs(loggedTotals.phone_pay)}</strong></div>
-      <div class="stat"><span>Logged card</span><strong>${rs(loggedTotals.card)}</strong></div>
       <div class="stat"><span>Logged credit</span><strong>${rs(loggedTotals.credit)}</strong></div>
-      <div class="stat"><span>Personal / Others</span><strong>${rs(Number(loggedTotals.personal) + Number(loggedTotals.others))}</strong></div>
+      <div class="stat"><span>Miscellaneous</span><strong>${rs(loggedTotals.miscellaneous)}</strong></div>
+      <div class="stat"><span>Beta</span><strong>${rs(loggedTotals.beta)}</strong></div>
       <div class="stat hero"><span>Total logged</span><strong>${rs(loggedTotals.total)}</strong></div>
     </section>
     <section class="form-card"><form method="post" class="grid-form">
       ${inlineError(error)}
       <label class="field span-2"><span>Active pump</span><select name="pump_id" onchange="window.location='/shift/close?pump_id='+this.value">${openPumps.map((p) => option(p.pump_id, `${p.business_date} - ${p.pump} - ${p.user_name}`, selectedPumpId)).join("")}</select></label>
+      <div class="form-section"><strong>${esc(selectedPump?.pump || "Pump")} opening readings</strong><small>Captured when the shift started.</small></div>
+      <label class="field"><span>MS opening meter</span><input value="${esc(selectedPump?.ms_opening ?? "")}" readonly></label>
+      <label class="field"><span>HSD opening meter</span><input value="${esc(selectedPump?.hsd_opening ?? "")}" readonly></label>
       <div class="form-section"><strong>${esc(selectedPump?.pump || "Pump")} closing meters</strong><small>Close MS and HSD together for this pump.</small></div>
       <label class="field"><span>MS closing meter</span><input name="closing_MS" type="number" step="0.001" value="${esc(fieldValue(values, "closing_MS", selectedPump?.ms_closing || ""))}" required></label>
       <label class="field"><span>HSD closing meter</span><input name="closing_HSD" type="number" step="0.001" value="${esc(fieldValue(values, "closing_HSD", selectedPump?.hsd_closing || ""))}" required></label>
       <label class="field"><span>MS testing qty</span><input name="testing_MS" type="number" step="0.001" value="${esc(fieldValue(values, "testing_MS", 0))}"></label>
       <label class="field"><span>HSD testing qty</span><input name="testing_HSD" type="number" step="0.001" value="${esc(fieldValue(values, "testing_HSD", 0))}"></label>
-      <div class="form-section"><strong>Additional collections</strong><small>Use only for last-minute payments not logged during the shift.</small></div>
-      <label class="field"><span>Extra cash</span><input name="cash" type="number" step="0.01" value="${esc(fieldValue(values, "cash", 0))}"></label>
-      <label class="field"><span>Extra phone pay</span><input name="upi" type="number" step="0.01" value="${esc(fieldValue(values, "upi", 0))}"></label>
-      <label class="field"><span>Extra card</span><input name="card" type="number" step="0.01" value="${esc(fieldValue(values, "card", 0))}"></label>
-      <label class="field"><span>Extra credit</span><input name="credit" type="number" step="0.01" value="${esc(fieldValue(values, "credit", 0))}"></label>
-      <label class="field"><span>Credit customer</span><select name="customer_id"><option value="">None</option>${customers.map((c) => option(c.id, c.name, fieldValue(values, "customer_id", ""))).join("")}</select></label>
       <label class="field"><span>Expenses</span><input name="expenses" type="number" step="0.01" value="${esc(fieldValue(values, "expenses", 0))}"></label>
       <label class="field"><span>Expense category</span><select name="expense_category">${DEFAULT_EXPENSE_CATEGORIES.map((c) => option(c, c, fieldValue(values, "expense_category", "Miscellaneous"))).join("")}</select></label>
-      <label class="field"><span>Beta</span><input name="beta" type="number" step="0.01" value="${esc(fieldValue(values, "beta", 0))}"></label>
-      <label class="field"><span>Miscellaneous</span><input name="miscellaneous" type="number" step="0.01" value="${esc(fieldValue(values, "miscellaneous", 0))}"></label>
       <label class="field span-2"><span>Remarks</span><textarea name="remarks">${esc(fieldValue(values, "remarks", ""))}</textarea></label>
       <div class="action-row"><button class="primary" ${openPumps.length ? "" : "disabled"}>Close Pump</button></div>
-    </form></section><section class="table-card">${table(openPumps)}</section>`));
+    </form></section>
+    <section class="table-card"><div class="table-card-head"><div><h2>Logged Payments</h2><p>These payments will be used for closing tally.</p></div></div>${tableColumns(paymentRows, ["time", "pump", "salesperson", "payment_type", "amount", "customer", "note"])}</section>
+    <section class="table-card">${tableColumns(openPumps, ["business_date", "pump", "user_name", "shift_name", "ms_opening", "hsd_opening", "status"])}</section>`));
 }
 
 app.route("/shift/close")
@@ -1950,30 +2029,25 @@ app.route("/shift/close")
       const amount = money(sold * Number(entry.rate));
       calculated.push({ entry, closing, testingQty, sold, amount });
     }
-    const currentPayments = { cash: 0, upi: 0, card: 0, credit: 0, personal: 0, others: 0 };
+    const currentPayments = { cash: 0, upi: 0, credit: 0, beta: 0, miscellaneous: 0 };
     for (const item of calculated) {
       const p = await getShiftPaymentsTotal(item.entry.id);
       currentPayments.cash += Number(p.cash || 0);
       currentPayments.upi += Number(p.upi || 0);
-      currentPayments.card += Number(p.card || 0);
       currentPayments.credit += Number(p.credit || 0);
-      currentPayments.personal += Number(p.personal || 0);
-      currentPayments.others += Number(p.others || 0);
+      currentPayments.beta += Number(p.beta || 0);
+      currentPayments.miscellaneous += Number(p.miscellaneous || 0);
     }
     const totalAmount = money(calculated.reduce((a, item) => a + item.amount, 0));
-    const cash = money(currentPayments.cash + money(req.body.cash));
-    const upi = money(currentPayments.upi + money(req.body.upi));
-    const card = money(currentPayments.card + money(req.body.card));
-    const extraCredit = money(req.body.credit);
-    const credit = money(currentPayments.credit + extraCredit);
+    const cash = money(currentPayments.cash);
+    const upi = money(currentPayments.upi);
+    const card = 0;
+    const credit = money(currentPayments.credit);
     const expenses = money(req.body.expenses);
-    const beta = money(req.body.beta);
-    const misc = money(Number(req.body.miscellaneous || 0) + currentPayments.personal + currentPayments.others);
+    const beta = money(currentPayments.beta);
+    const misc = money(currentPayments.miscellaneous);
     const shortage = money(cash + upi + card + credit + expenses + beta + misc - totalAmount);
-    const customerId = req.body.customer_id || null;
-    if (extraCredit > 0 && !customerId) {
-      return await renderShiftClose(req, res, req.body, "Select a credit customer for extra credit sale.");
-    }
+    const customerId = null;
     const share = (value, amount) => (totalAmount > 0 ? money(value * (amount / totalAmount)) : 0);
     for (let i = 0; i < calculated.length; i += 1) {
       const item = calculated[i];
@@ -2009,15 +2083,9 @@ app.route("/shift/close")
         ]
       );
       await run("UPDATE tanks SET current_stock=current_stock-? WHERE id=?", [item.sold, item.entry.tank_id]);
+      await saveDayNozzleReading(item.entry.day_id, item.entry.nozzle_id, Number(item.entry.opening_meter), item.closing);
     }
     if (expenses) await run("INSERT INTO expenses(business_date, shift_entry_id, paid_by, category, amount, note, payment_mode) VALUES(?,?,?,?,?,?,?)", [entries[0].business_date, entries[0].id, entries[0].user_id, req.body.expense_category || "Miscellaneous", expenses, req.body.expense_note || "", "Cash"]);
-    if (customerId && extraCredit > 0) {
-      await run("UPDATE customers SET balance=balance+? WHERE id=?", [extraCredit, customerId]);
-      for (const item of calculated) {
-        const allocatedCredit = share(extraCredit, item.amount);
-        if (allocatedCredit > 0) await run("INSERT INTO credit_ledger(customer_id, business_date, entry_type, product, litres, amount, pump_nozzle, team_member, shift_entry_id, notes) VALUES(?,?,?,?,?,?,?,?,?,?)", [customerId, item.entry.business_date, "credit", item.entry.product, item.sold, allocatedCredit, item.entry.pump, item.entry.user_name, item.entry.id, req.body.remarks || ""]);
-      }
-    }
     flash(req, Math.abs(shortage) <= 0.01 ? "success" : "warning", `Pump closed. Sales ${rs(totalAmount)} | Shortage/Excess ${rs(shortage)}`);
     res.redirect(`/reports?start=${encodeURIComponent(entries[0].business_date)}&end=${encodeURIComponent(entries[0].business_date)}`);
   });
@@ -2076,7 +2144,7 @@ app.route("/credit/payment")
         <label class="field"><span>Business date</span><input name="business_date" type="date" value="${todayIso()}" required></label>
         <label class="field"><span>Customer</span><select name="customer_id">${customers.map((c) => option(c.id, `${c.name} (${rs(c.balance)})`)).join("")}</select></label>
         <label class="field"><span>Amount</span><input name="amount" type="number" step="0.01" required></label>
-        <label class="field"><span>Payment mode</span><select name="payment_mode">${["Cash", "UPI", "Card"].map((m) => option(m)).join("")}</select></label>
+        <label class="field"><span>Payment mode</span><select name="payment_mode">${["Cash", "Phone Pay"].map((m) => option(m)).join("")}</select></label>
         <label class="field span-2"><span>Notes</span><textarea name="notes"></textarea></label>
         <div class="action-row"><button class="primary">Record Payment</button></div>
       </form></section>${table(ledger)}`));
@@ -2096,32 +2164,82 @@ app.route("/day/close")
       flash(req, "error", "No open day to close.");
       return res.redirect("/");
     }
-    const openCount = (await one("SELECT COUNT(*) c FROM shift_entries WHERE day_id=? AND status='Open'", [day.id])).c;
+    const openCount = (await one(
+      `SELECT COUNT(DISTINCT p.id) c
+       FROM shift_entries se JOIN nozzles n ON n.id=se.nozzle_id JOIN pumps p ON p.id=n.pump_id
+       WHERE se.day_id=? AND se.status='Open'`,
+      [day.id]
+    )).c;
     const metrics = await dashboardMetrics();
+    const readings = await all(
+      `SELECT p.id pump_id, p.name pump, n.id nozzle_id, n.product, dnr.opening_meter, dnr.closing_meter
+       FROM day_nozzle_readings dnr
+       JOIN nozzles n ON n.id=dnr.nozzle_id
+       JOIN pumps p ON p.id=n.pump_id
+       WHERE dnr.day_id=?
+       ORDER BY ${pumpOrderSql("p")}, n.product`,
+      [day.id]
+    );
+    const grouped = new Map();
+    for (const r of readings) {
+      if (!grouped.has(r.pump_id)) grouped.set(r.pump_id, { pump_id: r.pump_id, pump: r.pump, ms_opening: "", ms_closing: "", hsd_opening: "", hsd_closing: "" });
+      const row = grouped.get(r.pump_id);
+      if (r.product === "MS") {
+        row.ms_opening = r.opening_meter;
+        row.ms_closing = r.closing_meter ?? "";
+      }
+      if (r.product === "HSD") {
+        row.hsd_opening = r.opening_meter;
+        row.hsd_closing = r.closing_meter ?? "";
+      }
+    }
+    const closingInputs = Array.from(grouped.values()).map((p) => `
+      <div class="form-section"><strong>${esc(p.pump)}</strong><small>Final day closing readings</small></div>
+      <label class="field"><span>MS opening</span><input value="${esc(p.ms_opening)}" readonly></label>
+      <label class="field"><span>MS closing</span><input name="day_close_${p.pump_id}_MS" type="number" step="0.001" value="${esc(p.ms_closing)}" required></label>
+      <label class="field"><span>HSD opening</span><input value="${esc(p.hsd_opening)}" readonly></label>
+      <label class="field"><span>HSD closing</span><input name="day_close_${p.pump_id}_HSD" type="number" step="0.001" value="${esc(p.hsd_closing)}" required></label>
+    `).join("");
     res.send(layout(req, "Day Closing", `${pageHead("Day Closing", "Operations > Day Closing")}
       <section class="stat-grid"><div class="stat"><span>Open shifts</span><strong>${esc(openCount)}</strong></div><div class="stat"><span>Sales</span><strong>${rs(metrics.totals.sales)}</strong></div><div class="stat"><span>Cash</span><strong>${rs(metrics.totals.cash)}</strong></div><div class="stat"><span>Credit</span><strong>${rs(metrics.totals.credit)}</strong></div></section>
-      <section class="form-card"><form method="post" class="grid-form">
-        <label class="field"><span>Actual MS stock</span><input name="actual_ms" type="number" step="0.001" required></label>
-        <label class="field"><span>Actual HSD stock</span><input name="actual_hsd" type="number" step="0.001" required></label>
-        <label class="field"><span>Actual cash</span><input name="actual_cash" type="number" step="0.01"></label>
+      <section class="form-card"><form method="post" class="grid-form" onsubmit="return confirm('Close this business day? New day openings will use these closing readings.');">
+        ${closingInputs || '<div class="form-error span-2">Start the day and capture pump openings before day closing.</div>'}
         <div class="action-row"><button class="primary">Close Day</button></div>
       </form></section>`));
   })
   .post(requireLogin, requireRoles("admin", "manager"), async (req, res) => {
     const day = await activeDay();
-    const openCount = (await one("SELECT COUNT(*) c FROM shift_entries WHERE day_id=? AND status='Open'", [day.id])).c;
+    const openCount = (await one(
+      `SELECT COUNT(DISTINCT p.id) c
+       FROM shift_entries se JOIN nozzles n ON n.id=se.nozzle_id JOIN pumps p ON p.id=n.pump_id
+       WHERE se.day_id=? AND se.status='Open'`,
+      [day.id]
+    )).c;
     if (openCount) {
       flash(req, "error", "Close all open shifts before day closing.");
       return res.redirect("/day/close");
     }
-    const actualMs = litres(req.body.actual_ms);
-    const actualHsd = litres(req.body.actual_hsd);
-    await run("UPDATE days SET actual_ms=?, actual_hsd=?, actual_cash=?, status='Closed', closed_at=CURRENT_TIMESTAMP WHERE id=?", [actualMs, actualHsd, money(req.body.actual_cash), day.id]);
-    for (const [product, actual] of [["MS", actualMs], ["HSD", actualHsd]]) {
-      const tanks = await all("SELECT * FROM tanks WHERE product=? AND status='Active'", [product]);
-      const total = tanks.reduce((a, t) => a + Number(t.current_stock || 0), 0) || 1;
-      for (const tank of tanks) await run("UPDATE tanks SET current_stock=? WHERE id=?", [actual * (Number(tank.current_stock || 0) / total), tank.id]);
+    const readings = await all(
+      `SELECT p.id pump_id, n.id nozzle_id, n.product, dnr.opening_meter
+       FROM day_nozzle_readings dnr
+       JOIN nozzles n ON n.id=dnr.nozzle_id
+       JOIN pumps p ON p.id=n.pump_id
+       WHERE dnr.day_id=?`,
+      [day.id]
+    );
+    let actualMs = 0;
+    let actualHsd = 0;
+    for (const r of readings) {
+      const closing = Number(req.body[`day_close_${r.pump_id}_${r.product}`]);
+      if (Number.isNaN(closing)) {
+        flash(req, "error", `Enter ${r.product} closing reading for day closing.`);
+        return res.redirect("/day/close");
+      }
+      await saveDayNozzleReading(day.id, r.nozzle_id, Number(r.opening_meter || 0), closing);
+      if (r.product === "MS") actualMs += closing;
+      if (r.product === "HSD") actualHsd += closing;
     }
+    await run("UPDATE days SET actual_ms=?, actual_hsd=?, actual_cash=?, status='Closed', closed_at=CURRENT_TIMESTAMP WHERE id=?", [litres(actualMs), litres(actualHsd), 0, day.id]);
     flash(req, "success", "Day closed and entries locked.");
     res.redirect("/reports");
   });
@@ -2135,23 +2253,30 @@ app.post("/day/reopen/:id", requireLogin, requireRoles("admin"), async (req, res
 app.get("/reports", requireLogin, async (req, res) => {
   const start = req.query.start || todayIso();
   const end = req.query.end || start;
-  const product = req.query.product || "";
+  const pumpId = req.query.pump_id || "";
   const userId = req.user.role === "pump_boy" ? String(req.user.id) : req.query.user_id || "";
   const params = [start, end];
   let extra = "";
-  if (product) {
-    extra += " AND se.product=?";
-    params.push(product);
+  if (pumpId) {
+    extra += " AND p.id=?";
+    params.push(Number(pumpId));
   }
   if (userId) {
     extra += " AND se.user_id=?";
     params.push(userId);
   }
+  const pumps = await all(
+    "SELECT id, name FROM pumps WHERE status='Active' ORDER BY CASE WHEN name GLOB 'Pump [0-9]*' THEN CAST(SUBSTR(name, 6) AS INTEGER) ELSE 999999 END, name"
+  );
+  const users = req.user.role === "pump_boy"
+    ? []
+    : await all("SELECT id, name FROM users WHERE status='Active' AND role IN ('admin','manager','pump_boy') ORDER BY name");
   const shiftRows = await all(
-    `SELECT se.business_date, p.id pump_id, p.name pump, u.name user_name, sd.name shift_name, se.product,
-     se.litres_sold, se.sales_amount, se.cash, se.upi, se.card, se.credit, se.expenses, se.beta, se.shortage_excess, se.status
+    `SELECT se.business_date, d.ms_price, d.hsd_price, p.id pump_id, p.name pump, u.name user_name, sd.name shift_name, se.product,
+     se.litres_sold, se.sales_amount, se.cash, se.upi, se.credit, se.expenses, se.beta, se.miscellaneous, se.shortage_excess, se.status
      FROM shift_entries se JOIN users u ON u.id=se.user_id JOIN shift_defs sd ON sd.id=se.shift_def_id
      JOIN nozzles n ON n.id=se.nozzle_id JOIN pumps p ON p.id=n.pump_id
+     LEFT JOIN days d ON d.id=se.day_id
      WHERE se.business_date BETWEEN ? AND ? ${extra}
      ORDER BY se.business_date DESC, ${pumpOrderSql("p")}, se.product`,
     params
@@ -2165,14 +2290,17 @@ app.get("/reports", requireLogin, async (req, res) => {
         pump: row.pump,
         team_member: row.user_name,
         shift: row.shift_name,
+        ms_price: money(row.ms_price || 0),
+        hsd_price: money(row.hsd_price || 0),
         ms_litres: 0,
         hsd_litres: 0,
-        total_litres: 0,
         sales: 0,
         cash: 0,
-        upi: 0,
-        card: 0,
+        phone_pay: 0,
         credit: 0,
+        beta: 0,
+        miscellaneous: 0,
+        expenses: 0,
         shortage_excess: 0,
         status: row.status,
       });
@@ -2180,25 +2308,32 @@ app.get("/reports", requireLogin, async (req, res) => {
     const item = reportMap.get(key);
     if (row.product === "MS") item.ms_litres = litres(Number(item.ms_litres) + Number(row.litres_sold || 0));
     if (row.product === "HSD") item.hsd_litres = litres(Number(item.hsd_litres) + Number(row.litres_sold || 0));
-    item.total_litres = litres(Number(item.total_litres) + Number(row.litres_sold || 0));
     item.sales = money(Number(item.sales) + Number(row.sales_amount || 0));
     item.cash = money(Number(item.cash) + Number(row.cash || 0));
-    item.upi = money(Number(item.upi) + Number(row.upi || 0));
-    item.card = money(Number(item.card) + Number(row.card || 0));
+    item.phone_pay = money(Number(item.phone_pay) + Number(row.upi || 0));
     item.credit = money(Number(item.credit) + Number(row.credit || 0));
+    item.beta = money(Number(item.beta) + Number(row.beta || 0));
+    item.miscellaneous = money(Number(item.miscellaneous) + Number(row.miscellaneous || 0));
+    item.expenses = money(Number(item.expenses) + Number(row.expenses || 0));
     item.shortage_excess = money(Number(item.shortage_excess) + Number(row.shortage_excess || 0));
   }
   const shifts = Array.from(reportMap.values());
   const summary = await one(
-    `SELECT COALESCE(SUM(litres_sold),0) litres, COALESCE(SUM(sales_amount),0) sales,
-     COALESCE(SUM(cash),0) cash, COALESCE(SUM(upi),0) upi, COALESCE(SUM(card),0) card,
+    `SELECT
+     COALESCE(SUM(CASE WHEN se.product='MS' THEN se.litres_sold ELSE 0 END),0) ms_litres,
+     COALESCE(SUM(CASE WHEN se.product='HSD' THEN se.litres_sold ELSE 0 END),0) hsd_litres,
+     COALESCE(SUM(sales_amount),0) sales,
+     COALESCE(SUM(cash),0) cash, COALESCE(SUM(upi),0) upi,
      COALESCE(SUM(credit),0) credit, COALESCE(SUM(expenses),0) expenses,
-     COALESCE(SUM(beta),0) beta, COALESCE(SUM(shortage_excess),0) shortage
-     FROM shift_entries se WHERE se.business_date BETWEEN ? AND ? ${extra}`,
+     COALESCE(SUM(beta),0) beta, COALESCE(SUM(miscellaneous),0) miscellaneous, COALESCE(SUM(shortage_excess),0) shortage
+     FROM shift_entries se
+     JOIN nozzles n ON n.id=se.nozzle_id
+     JOIN pumps p ON p.id=n.pump_id
+     WHERE se.business_date BETWEEN ? AND ? ${extra}`,
     params
   );
   const paymentRows = await all(
-    `SELECT se.business_date, u.name team_member, p.name pump, sp.product, sp.payment_type,
+    `SELECT se.business_date, p.name pump, u.name team_member, sp.payment_type,
      COALESCE(SUM(sp.amount),0) amount, COUNT(*) entries
      FROM shift_payments sp
      JOIN shift_entries se ON se.id=sp.shift_entry_id
@@ -2206,44 +2341,54 @@ app.get("/reports", requireLogin, async (req, res) => {
      JOIN nozzles n ON n.id=se.nozzle_id
      JOIN pumps p ON p.id=n.pump_id
      WHERE se.business_date BETWEEN ? AND ? ${extra}
-     GROUP BY se.business_date, u.id, u.name, p.id, p.name, sp.product, sp.payment_type
-     ORDER BY se.business_date DESC, u.name, ${pumpOrderSql("p")}, sp.product, sp.payment_type`,
+     GROUP BY se.business_date, u.id, u.name, p.id, p.name, sp.payment_type
+     ORDER BY se.business_date DESC, ${pumpOrderSql("p")}, u.name, sp.payment_type`,
     params
   );
   const salesmanRows = await all(
-    `SELECT se.business_date, u.name team_member,
+    `SELECT se.business_date, p.name pump, u.name team_member,
      COALESCE(SUM(CASE WHEN se.product='MS' THEN se.litres_sold ELSE 0 END),0) ms_litres,
      COALESCE(SUM(CASE WHEN se.product='HSD' THEN se.litres_sold ELSE 0 END),0) hsd_litres,
      COALESCE(SUM(se.sales_amount),0) sales,
      COALESCE(SUM(se.cash),0) cash,
      COALESCE(SUM(se.upi),0) phone_pay,
-     COALESCE(SUM(se.card),0) card,
      COALESCE(SUM(se.credit),0) credit,
-     COALESCE(SUM(se.miscellaneous),0) personal_others,
+     COALESCE(SUM(se.beta),0) beta,
+     COALESCE(SUM(se.miscellaneous),0) miscellaneous,
      COALESCE(SUM(se.shortage_excess),0) shortage_excess
      FROM shift_entries se
      JOIN users u ON u.id=se.user_id
+     JOIN nozzles n ON n.id=se.nozzle_id
+     JOIN pumps p ON p.id=n.pump_id
      WHERE se.business_date BETWEEN ? AND ? ${extra}
-     GROUP BY se.business_date, u.id, u.name
-     ORDER BY se.business_date DESC, u.name`,
+     GROUP BY se.business_date, p.id, p.name, u.id, u.name
+     ORDER BY se.business_date DESC, ${pumpOrderSql("p")}, u.name`,
     params
   );
   res.send(layout(req, "Reports", `${pageHead("Reports", "Operations > Reports", '<a class="link-button" href="/export/shifts.csv">Export CSV</a>')}
     <section class="form-card"><form method="get" class="grid-form">
       <label class="field"><span>Start</span><input name="start" type="date" value="${esc(start)}"></label>
       <label class="field"><span>End</span><input name="end" type="date" value="${esc(end)}"></label>
-      <label class="field"><span>Product</span><select name="product"><option value="">All</option>${PRODUCTS.map((p) => option(p, p, product)).join("")}</select></label>
+      <label class="field"><span>Pump</span><select name="pump_id"><option value="">All pumps</option>${pumps.map((p) => option(p.id, p.name, pumpId)).join("")}</select></label>
+      ${req.user.role === "pump_boy" ? "" : `<label class="field"><span>Salesperson</span><select name="user_id"><option value="">All salespeople</option>${users.map((u) => option(u.id, u.name, userId)).join("")}</select></label>`}
       <div class="action-row"><button class="primary">Filter</button></div>
     </form></section>
-    <section class="stat-grid"><div class="stat"><span>Litres</span><strong>${ltr(summary.litres)}</strong></div><div class="stat"><span>Sales</span><strong>${rs(summary.sales)}</strong></div><div class="stat"><span>Cash</span><strong>${rs(summary.cash)}</strong></div><div class="stat"><span>Phone Pay</span><strong>${rs(summary.upi)}</strong></div><div class="stat"><span>Credit</span><strong>${rs(summary.credit)}</strong></div><div class="stat"><span>Shortage</span><strong>${rs(summary.shortage)}</strong></div></section>
-    <section class="table-card"><div class="table-card-head"><div><h2>Complete Sales Data</h2><p>Pump-wise MS/HSD sales grouped for the selected dates.</p></div></div>${table(shifts)}</section>
-    <section class="table-card"><div class="table-card-head"><div><h2>Salesman Date Data</h2><p>Daily totals by team member.</p></div></div>${table(salesmanRows)}</section>
-    <section class="table-card"><div class="table-card-head"><div><h2>Payment Log Summary</h2><p>Payments logged during active shifts by type and product.</p></div></div>${table(paymentRows)}</section>`));
+    <section class="stat-grid"><div class="stat"><span>MS litres</span><strong>${ltr(summary.ms_litres)}</strong></div><div class="stat"><span>HSD litres</span><strong>${ltr(summary.hsd_litres)}</strong></div><div class="stat hero"><span>Sales</span><strong>${rs(summary.sales)}</strong></div><div class="stat"><span>Cash</span><strong>${rs(summary.cash)}</strong></div><div class="stat"><span>Phone Pay</span><strong>${rs(summary.upi)}</strong></div><div class="stat"><span>Credit</span><strong>${rs(summary.credit)}</strong></div><div class="stat"><span>Shortage</span><strong>${rs(summary.shortage)}</strong></div></section>
+    <section class="table-card"><div class="table-card-head"><div><h2>Complete Sales Data</h2><p>Pump-wise MS/HSD sales grouped for the selected dates.</p></div></div>${tableColumns(shifts, ["business_date", "pump", "team_member", "shift", "ms_price", "hsd_price", "ms_litres", "hsd_litres", "sales", "cash", "phone_pay", "credit", "beta", "miscellaneous", "expenses", "shortage_excess", "status"])}</section>
+    <section class="table-card"><div class="table-card-head"><div><h2>Salesperson Date Data</h2><p>Daily totals by pump and team member.</p></div></div>${tableColumns(salesmanRows, ["business_date", "pump", "team_member", "ms_litres", "hsd_litres", "sales", "cash", "phone_pay", "credit", "beta", "miscellaneous", "shortage_excess"])}</section>
+    <section class="table-card"><div class="table-card-head"><div><h2>Payment Log Summary</h2><p>Payments logged during active shifts by pump and type.</p></div></div>${tableColumns(paymentRows, ["business_date", "pump", "team_member", "payment_type", "amount", "entries"])}</section>`));
 });
 
 app.get("/export/shifts.csv", requireLogin, requireRoles("admin", "manager"), async (_req, res) => {
-  const rows = await all("SELECT business_date, product, litres_sold, sales_amount, cash, upi, card, credit, expenses, beta, shortage_excess, status FROM shift_entries ORDER BY business_date DESC");
-  const lines = ["date,product,litres,sales,cash,upi,card,credit,expenses,beta,shortage_excess,status"];
+  const rows = await all(
+    `SELECT se.business_date, p.name pump, se.product, se.litres_sold, se.sales_amount, se.cash, se.upi phone_pay,
+     se.credit, se.expenses, se.beta, se.miscellaneous, se.shortage_excess, se.status
+     FROM shift_entries se
+     JOIN nozzles n ON n.id=se.nozzle_id
+     JOIN pumps p ON p.id=n.pump_id
+     ORDER BY se.business_date DESC, ${pumpOrderSql("p")}, se.product`
+  );
+  const lines = ["date,pump,product,litres,sales,cash,phone_pay,credit,expenses,beta,miscellaneous,shortage_excess,status"];
   for (const row of rows) lines.push(Object.values(row).map((v) => `"${String(v ?? 0).replaceAll('"', '""')}"`).join(","));
   res.setHeader("Content-Type", "text/csv");
   res.setHeader("Content-Disposition", "attachment; filename=shift-report.csv");

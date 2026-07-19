@@ -26,7 +26,8 @@
      - time
      - amount
      - payment type
-     - product dropdown: MS or HSD
+     - pump
+     - assigned salesperson/user
    - Closing shift should automatically total/tally these payments.
 
 3. Closing and tallying.
@@ -43,6 +44,46 @@
 5. Screenshots are field/layout references only.
    - Ignore dummy values in screenshots.
    - Use the screenshots to understand required fields and reporting shape.
+
+## Confirmed Next Fix Batch
+
+- Payments must be pump-based only.
+  - Show pump and assigned user/salesperson.
+  - Remove product selection from payment entry.
+  - Credit customer should appear only when payment type is Credit.
+  - Payment types: Cash, Phone Pay, Credit, Miscellaneous, Beta.
+  - Remove Card.
+- Active Shifts and Close Shift should show pump rows once, not MS/HSD as separate operational rows.
+- Close Shift should:
+  - show opening readings
+  - show all logged payments for the pump
+  - remove additional collections
+  - use logged payments for tallying
+- Day Closing should:
+  - count open shifts by pump, not internal MS/HSD rows
+  - ask confirmation before closing day
+  - collect manual closing readings pump-wise for MS and HSD
+  - save those values so next Day Start can auto-fill pump opening meters
+- Day Start should:
+  - remove opening cash
+  - disable starting a duplicate day
+  - show/edit existing open day instead of starting again
+  - auto-pick opening meters from the previous closed day
+  - not auto-fill from an unclosed day
+  - make auto-filled opening meters read-only, with a separate edit path
+- Dashboard should show salesperson-wise sales.
+- Reports should:
+  - filter by pump and salesperson
+  - make pump mandatory in all tables
+  - group Pump 1/Pump 2 once with MS/HSD data inside
+  - remove total litres
+  - add MS and HSD price for that day
+
+## Explicitly Ignored For Now
+
+- Price change difference report is not required now.
+- Day closing login changes are not required now.
+- Pump 2 visibility issue is working now and should not be changed for that reason.
 
 ## Implementation Order
 
