@@ -10,11 +10,20 @@ This repository has been converted to a Node.js app for Hostinger's Node.js app 
 - Node version: Node 20 or newer
 - Port: use Hostinger's provided `PORT` environment variable
 - Required environment variable: `SESSION_SECRET`
-- Optional environment variable: `PETROL_DB` if the SQLite file is stored outside the project root
+- Optional environment variable: `PETROL_DATA_DIR` for the persistent SQLite folder
+- Optional environment variable: `PETROL_DB` for the exact SQLite file path
 
 ## Data
 
-The app uses `petrol_station.sqlite3` in the project root by default. Keep a backup before every live deploy if real station data is inside this file.
+On Linux/Hostinger, the app stores SQLite outside the deploy folder by default:
+
+```text
+$HOME/petrol-station-data/petrol_station.sqlite3
+```
+
+On first startup after this change, if the persistent DB is missing and an old `petrol_station.sqlite3` exists in the app folder, the app copies it into the persistent folder. It never overwrites an existing persistent DB.
+
+Keep backups before major live changes. `/health` shows the active `database_dir` so you can verify the app is not using the deploy folder.
 
 ## Local run
 

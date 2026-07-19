@@ -6,7 +6,13 @@ const session = require("express-session");
 const initSqlJs = require("sql.js");
 
 const BASE_DIR = __dirname;
-const DATABASE = process.env.PETROL_DB || path.join(BASE_DIR, "petrol_station.sqlite3");
+const LEGACY_DATABASE = path.join(BASE_DIR, "petrol_station.sqlite3");
+const DEFAULT_DATA_DIR =
+  process.platform === "win32"
+    ? BASE_DIR
+    : path.join(process.env.HOME || path.dirname(BASE_DIR), "petrol-station-data");
+const DATA_DIR = process.env.PETROL_DATA_DIR || DEFAULT_DATA_DIR;
+const DATABASE = process.env.PETROL_DB || path.join(DATA_DIR, "petrol_station.sqlite3");
 const PORT = Number(process.env.PORT || 3000);
 
 const app = express();
@@ -271,7 +277,17 @@ function run(sql, params = []) {
 
 function persistDb() {
   if (!db) return;
+  fs.mkdirSync(path.dirname(DATABASE), { recursive: true });
   fs.writeFileSync(DATABASE, Buffer.from(db.export()));
+}
+
+function prepareDatabaseFile() {
+  fs.mkdirSync(path.dirname(DATABASE), { recursive: true });
+  if (fs.existsSync(DATABASE)) return;
+  if (DATABASE !== LEGACY_DATABASE && fs.existsSync(LEGACY_DATABASE)) {
+    fs.copyFileSync(LEGACY_DATABASE, DATABASE);
+    return;
+  }
 }
 
 function money(value) {
@@ -1634,11 +1650,18 @@ app.get("/export/shifts.csv", requireLogin, requireRoles("admin", "manager"), (_
 
 app.get("/health", (_req, res) => {
   initDb();
-  res.json({ ok: true, runtime: "node", database: path.basename(DATABASE) });
+  res.json({
+    ok: true,
+    runtime: "node",
+    database: path.basename(DATABASE),
+    database_dir: path.dirname(DATABASE),
+    database_source: process.env.PETROL_DB ? "PETROL_DB" : process.env.PETROL_DATA_DIR ? "PETROL_DATA_DIR" : "default_persistent",
+  });
 });
 
 async function start() {
   const SQL = await initSqlJs();
+  prepareDatabaseFile();
   const fileBuffer = fs.existsSync(DATABASE) ? fs.readFileSync(DATABASE) : null;
   db = fileBuffer ? new SQL.Database(fileBuffer) : new SQL.Database();
   db.exec("PRAGMA foreign_keys = ON");
