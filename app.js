@@ -919,9 +919,7 @@ function renderDayStart(req, res, values = {}, error = "") {
      WHERE n.status='Active' AND p.status='Active'
      ORDER BY p.name, n.product, n.name`
   );
-  const lastDay = one("SELECT * FROM days WHERE status='Closed' ORDER BY business_date DESC LIMIT 1");
-  const suggestedMs = lastDay?.actual_ms ?? tanks.filter((t) => t.product === "MS").reduce((a, t) => a + Number(t.current_stock || 0), 0);
-  const suggestedHsd = lastDay?.actual_hsd ?? tanks.filter((t) => t.product === "HSD").reduce((a, t) => a + Number(t.current_stock || 0), 0);
+  const firstPumpName = nozzles[0]?.pump || "Pump 1";
   const currentDay = activeDay();
   const currentRows = currentDay ? dayOpeningRows(currentDay.id) : [];
   const recentDays = all("SELECT id, business_date, ms_price, hsd_price, opening_cash, status FROM days ORDER BY business_date DESC LIMIT 10");
@@ -932,19 +930,16 @@ function renderDayStart(req, res, values = {}, error = "") {
       <label class="field"><span>Opening cash</span><input name="opening_cash" type="number" step="0.01" value="${esc(fieldValue(values, "opening_cash", ""))}"></label>
       <label class="field"><span>MS price</span><input name="ms_price" type="number" step="0.01" value="${esc(fieldValue(values, "ms_price", ""))}" required></label>
       <label class="field"><span>HSD price</span><input name="hsd_price" type="number" step="0.01" value="${esc(fieldValue(values, "hsd_price", ""))}" required></label>
-      <label class="field"><span>Opening MS stock</span><input name="opening_ms" type="number" step="0.001" value="${esc(fieldValue(values, "opening_ms", suggestedMs))}"></label>
-      <label class="field"><span>Opening HSD stock</span><input name="opening_hsd" type="number" step="0.001" value="${esc(fieldValue(values, "opening_hsd", suggestedHsd))}"></label>
-      <label class="field"><span>Testing done</span><select name="testing_done">${option("", "No", fieldValue(values, "testing_done", ""))}${option("1", "Yes", fieldValue(values, "testing_done", ""))}</select></label>
-      <label class="field"><span>MS testing qty</span><input name="testing_ms_qty" type="number" step="0.001" value="${esc(fieldValue(values, "testing_ms_qty", 0))}"></label>
-      <label class="field"><span>HSD testing qty</span><input name="testing_hsd_qty" type="number" step="0.001" value="${esc(fieldValue(values, "testing_hsd_qty", 0))}"></label>
-      <div class="form-section"><strong>Tank opening dips</strong><small>Physical stock at day start</small></div>
-      ${tanks.map((t) => `<label class="field"><span>${esc(t.name)} opening dip</span><input name="tank_${t.id}_opening" type="number" step="0.001" value="${esc(fieldValue(values, `tank_${t.id}_opening`, t.current_stock || 0))}"></label>`).join("")}
       <div class="form-section"><strong>Pump opening meter readings</strong><small>Saved by nozzle for shift start</small></div>
       ${nozzles.map((n) => {
         const name = `nozzle_${n.id}_opening`;
         const suggested = lastMeter(n.id) ?? 0;
         return `<label class="field"><span>${esc(n.pump)} ${esc(n.product)} (${esc(n.name)})</span><input name="${name}" type="number" step="0.001" value="${esc(fieldValue(values, name, suggested))}" required></label>`;
       }).join("") || '<div class="form-error span-2">Add active pumps and nozzles before starting the day.</div>'}
+      <div class="form-section"><strong>${esc(firstPumpName)} testing</strong><small>Testing quantity is linked to the first pump.</small></div>
+      <label class="field"><span>${esc(firstPumpName)} testing done</span><select name="testing_done">${option("", "No", fieldValue(values, "testing_done", ""))}${option("1", "Yes", fieldValue(values, "testing_done", ""))}</select></label>
+      <label class="field"><span>${esc(firstPumpName)} MS testing qty</span><input name="testing_ms_qty" type="number" step="0.001" value="${esc(fieldValue(values, "testing_ms_qty", 0))}"></label>
+      <label class="field"><span>${esc(firstPumpName)} HSD testing qty</span><input name="testing_hsd_qty" type="number" step="0.001" value="${esc(fieldValue(values, "testing_hsd_qty", 0))}"></label>
       <label class="field span-2"><span>Notes</span><textarea name="notes">${esc(fieldValue(values, "notes", ""))}</textarea></label>
       <div class="action-row"><button class="primary" ${nozzles.length ? "" : "disabled"}>Start Day</button></div>
     </form></section>
@@ -975,15 +970,17 @@ app.route("/day/start")
       }
     }
     const testingDone = b.testing_done ? 1 : 0;
+    const openingMs = all("SELECT current_stock FROM tanks WHERE product='MS' AND status='Active'").reduce((a, t) => a + Number(t.current_stock || 0), 0);
+    const openingHsd = all("SELECT current_stock FROM tanks WHERE product='HSD' AND status='Active'").reduce((a, t) => a + Number(t.current_stock || 0), 0);
     const result = run(
       `INSERT INTO days(business_date, ms_price, hsd_price, opening_ms, opening_hsd, testing_done, testing_ms_qty, testing_hsd_qty, opening_cash, notes)
        VALUES(?,?,?,?,?,?,?,?,?,?)`,
-      [b.business_date, Number(b.ms_price), Number(b.hsd_price), Number(b.opening_ms || 0), Number(b.opening_hsd || 0), testingDone, testingDone ? Number(b.testing_ms_qty || 0) : 0, testingDone ? Number(b.testing_hsd_qty || 0) : 0, Number(b.opening_cash || 0), b.notes || ""]
+      [b.business_date, Number(b.ms_price), Number(b.hsd_price), openingMs, openingHsd, testingDone, testingDone ? Number(b.testing_ms_qty || 0) : 0, testingDone ? Number(b.testing_hsd_qty || 0) : 0, Number(b.opening_cash || 0), b.notes || ""]
     );
     for (const tank of all("SELECT * FROM tanks WHERE status='Active'")) {
-      const opening = Number(b[`tank_${tank.id}_opening`] || tank.current_stock || 0);
+      const opening = Number(tank.current_stock || 0);
       run("INSERT INTO tank_readings(day_id, tank_id, opening_dip) VALUES(?,?,?)", [result.lastInsertRowid, tank.id, opening]);
-      run("UPDATE tanks SET current_stock=?, opening_dip=? WHERE id=?", [opening, opening, tank.id]);
+      run("UPDATE tanks SET opening_dip=? WHERE id=?", [opening, tank.id]);
     }
     for (const nozzle of nozzles) {
       run("INSERT INTO day_nozzle_readings(day_id, nozzle_id, opening_meter) VALUES(?,?,?)", [result.lastInsertRowid, nozzle.id, Number(b[`nozzle_${nozzle.id}_opening`])]);
