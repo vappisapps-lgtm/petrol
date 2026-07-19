@@ -1591,6 +1591,7 @@ async function dayReportRows(dayId) {
         business_date: row.business_date,
         ms_price: Number(row.ms_price || 0),
         hsd_price: Number(row.hsd_price || 0),
+        pump_id: row.pump_id,
         pump: row.pump,
         ms_opening: "",
         ms_closing: "",
@@ -1666,6 +1667,67 @@ function renderDayReport(day, rows) {
       <thead><tr><th>Pump</th><th>MS opening</th><th>MS closing</th><th>MS test</th><th>MS litres</th><th>MS sales (${esc(money(day.ms_price).toFixed(2))})</th><th>HSD opening</th><th>HSD closing</th><th>HSD test</th><th>HSD litres</th><th>HSD sales (${esc(money(day.hsd_price).toFixed(2))})</th><th>Total sales</th></tr></thead>
       <tbody>${rowHtml}<tr><td><strong>Total</strong></td><td></td><td></td><td><strong>${esc(fmtNum(totals.ms_test))}</strong></td><td><strong>${esc(fmtNum(totals.ms_litres))}</strong></td><td><strong>${esc(rs(totals.ms_sales))}</strong></td><td></td><td></td><td><strong>${esc(fmtNum(totals.hsd_test))}</strong></td><td><strong>${esc(fmtNum(totals.hsd_litres))}</strong></td><td><strong>${esc(rs(totals.hsd_sales))}</strong></td><td><strong>${esc(rs(totals.total_sales))}</strong></td></tr></tbody>
     </table></div></section>`;
+}
+
+function meterOrNull(value) {
+  if (value === "" || value == null) return null;
+  const number = Number(value);
+  return Number.isFinite(number) ? number : null;
+}
+
+async function reportPriceAdjustmentContext(days) {
+  const priceByDate = new Map();
+  const dayClosingByKey = new Map();
+  const renderedReports = [];
+
+  for (const day of days) {
+    const previous = await previousClosedDay(day.business_date);
+    const rows = await dayReportRows(day.id);
+    priceByDate.set(day.business_date, {
+      ms_old_price: money(previous ? previous.ms_price : day.ms_price),
+      ms_new_price: money(day.ms_price),
+      hsd_old_price: money(previous ? previous.hsd_price : day.hsd_price),
+      hsd_new_price: money(day.hsd_price),
+    });
+    for (const row of rows) {
+      dayClosingByKey.set(`${day.business_date}-${row.pump_id}-MS`, meterOrNull(row.ms_closing));
+      dayClosingByKey.set(`${day.business_date}-${row.pump_id}-HSD`, meterOrNull(row.hsd_closing));
+    }
+    renderedReports.push(renderDayReport(day, rows));
+  }
+
+  return {
+    priceByDate,
+    dayClosingByKey,
+    dayReportTables: renderedReports.join(""),
+  };
+}
+
+function addPriceAdjustmentFields(row, priceByDate, dayClosingByKey) {
+  const prices = priceByDate.get(row.business_date) || {
+    ms_old_price: money(row.ms_price || 0),
+    ms_new_price: money(row.ms_price || 0),
+    hsd_old_price: money(row.hsd_price || 0),
+    hsd_new_price: money(row.hsd_price || 0),
+  };
+  const msDayClosing = dayClosingByKey.get(`${row.business_date}-${row.pump_id}-MS`);
+  const hsdDayClosing = dayClosingByKey.get(`${row.business_date}-${row.pump_id}-HSD`);
+  const msReportClosing = meterOrNull(row.ms_closing);
+  const hsdReportClosing = meterOrNull(row.hsd_closing);
+  const msPriceDiffLitres = msReportClosing == null || msDayClosing == null ? 0 : litres(Math.max(0, msReportClosing - msDayClosing));
+  const hsdPriceDiffLitres = hsdReportClosing == null || hsdDayClosing == null ? 0 : litres(Math.max(0, hsdReportClosing - hsdDayClosing));
+
+  return {
+    ...row,
+    ms_old_price: prices.ms_old_price,
+    ms_new_price: prices.ms_new_price,
+    ms_price_diff_litres: msPriceDiffLitres,
+    ms_price_difference: money(msPriceDiffLitres * (prices.ms_new_price - prices.ms_old_price)),
+    hsd_old_price: prices.hsd_old_price,
+    hsd_new_price: prices.hsd_new_price,
+    hsd_price_diff_litres: hsdPriceDiffLitres,
+    hsd_price_difference: money(hsdPriceDiffLitres * (prices.hsd_new_price - prices.hsd_old_price)),
+  };
 }
 
 async function shiftWiseSalesRows(dayId) {
@@ -2449,6 +2511,7 @@ app.get("/reports", requireLogin, async (req, res) => {
     if (!reportMap.has(key)) {
       reportMap.set(key, {
         business_date: row.business_date,
+        pump_id: row.pump_id,
         pump: row.pump,
         team_member: row.user_name,
         shift: row.shift_name,
@@ -2491,7 +2554,9 @@ app.get("/reports", requireLogin, async (req, res) => {
     item.expenses = money(Number(item.expenses) + Number(row.expenses || 0));
     item.shortage_excess = money(Number(item.shortage_excess) + Number(row.shortage_excess || 0));
   }
-  const shifts = Array.from(reportMap.values());
+  const reportDays = await all("SELECT * FROM days WHERE business_date BETWEEN ? AND ? ORDER BY business_date DESC, id DESC", [start, end]);
+  const { priceByDate, dayClosingByKey, dayReportTables } = await reportPriceAdjustmentContext(reportDays);
+  const shifts = Array.from(reportMap.values()).map((row) => addPriceAdjustmentFields(row, priceByDate, dayClosingByKey));
   const summary = await one(
     `SELECT
      COALESCE(SUM(CASE WHEN se.product='MS' THEN se.litres_sold ELSE 0 END),0) ms_litres,
@@ -2519,8 +2584,8 @@ app.get("/reports", requireLogin, async (req, res) => {
      ORDER BY se.business_date DESC, ${pumpOrderSql("p")}, u.name, sp.payment_type`,
     params
   );
-  const salesmanRows = await all(
-    `SELECT se.business_date, p.name pump, u.name team_member,
+  const salesmanRowsRaw = await all(
+    `SELECT se.business_date, p.id pump_id, p.name pump, u.name team_member,
      MIN(CASE WHEN se.product='MS' THEN se.opening_meter END) ms_opening,
      MAX(CASE WHEN se.product='MS' THEN se.closing_meter END) ms_closing,
      COALESCE(SUM(CASE WHEN se.product='MS' THEN se.litres_sold ELSE 0 END),0) ms_litres,
@@ -2543,8 +2608,7 @@ app.get("/reports", requireLogin, async (req, res) => {
      ORDER BY se.business_date DESC, ${pumpOrderSql("p")}, u.name`,
     params
   );
-  const reportDays = await all("SELECT * FROM days WHERE business_date BETWEEN ? AND ? ORDER BY business_date DESC, id DESC", [start, end]);
-  const dayReportTables = (await Promise.all(reportDays.map(async (day) => renderDayReport(day, await dayReportRows(day.id))))).join("");
+  const salesmanRows = salesmanRowsRaw.map((row) => addPriceAdjustmentFields(row, priceByDate, dayClosingByKey));
   res.send(layout(req, "Reports", `${pageHead("Reports", "Operations > Reports", '<a class="link-button" href="/export/shifts.csv">Export CSV</a>')}
     <section class="form-card"><form method="get" class="grid-form">
       <label class="field"><span>Start</span><input name="start" type="date" value="${esc(start)}"></label>
@@ -2555,8 +2619,8 @@ app.get("/reports", requireLogin, async (req, res) => {
     </form></section>
     <section class="stat-grid"><div class="stat"><span>MS litres</span><strong>${ltr(summary.ms_litres)}</strong></div><div class="stat"><span>HSD litres</span><strong>${ltr(summary.hsd_litres)}</strong></div><div class="stat hero"><span>Sales</span><strong>${rs(summary.sales)}</strong></div><div class="stat"><span>Cash</span><strong>${rs(summary.cash)}</strong></div><div class="stat"><span>Phone Pay</span><strong>${rs(summary.upi)}</strong></div><div class="stat"><span>Credit</span><strong>${rs(summary.credit)}</strong></div><div class="stat"><span>Shortage</span><strong>${rs(summary.shortage)}</strong></div></section>
     ${dayReportTables || '<section class="table-card"><div class="table-card-head"><div><h2>Day Report</h2><p>No day report is available for this date range.</p></div></div><div class="table-wrap"><table><thead><tr><th>Records</th></tr></thead><tbody><tr><td>No records yet.</td></tr></tbody></table></div></section>'}
-    <section class="table-card"><div class="table-card-head"><div><h2>Complete Sales Data</h2><p>Pump-wise MS/HSD readings and sales grouped for the selected dates.</p></div></div>${tableColumns(shifts, ["business_date", "pump", "team_member", "shift", "ms_price", "hsd_price", "ms_opening", "ms_closing", "ms_litres", "hsd_opening", "hsd_closing", "hsd_litres", "sales", "cash", "phone_pay", "credit", "beta", "miscellaneous", "expenses", "shortage_excess", "status"])}</section>
-    <section class="table-card"><div class="table-card-head"><div><h2>Salesperson Date Data</h2><p>Daily readings and totals by pump and team member.</p></div></div>${tableColumns(salesmanRows, ["business_date", "pump", "team_member", "ms_opening", "ms_closing", "ms_litres", "hsd_opening", "hsd_closing", "hsd_litres", "sales", "cash", "phone_pay", "credit", "beta", "miscellaneous", "shortage_excess"])}</section>
+    <section class="table-card"><div class="table-card-head"><div><h2>Complete Sales Data</h2><p>Pump-wise MS/HSD readings and sales grouped for the selected dates.</p></div></div>${tableColumns(shifts, ["business_date", "pump", "team_member", "shift", "ms_old_price", "ms_new_price", "ms_opening", "ms_closing", "ms_price_diff_litres", "ms_price_difference", "ms_litres", "hsd_old_price", "hsd_new_price", "hsd_opening", "hsd_closing", "hsd_price_diff_litres", "hsd_price_difference", "hsd_litres", "sales", "cash", "phone_pay", "credit", "beta", "miscellaneous", "expenses", "shortage_excess", "status"])}</section>
+    <section class="table-card"><div class="table-card-head"><div><h2>Salesperson Date Data</h2><p>Daily readings and totals by pump and team member.</p></div></div>${tableColumns(salesmanRows, ["business_date", "pump", "team_member", "ms_old_price", "ms_new_price", "ms_opening", "ms_closing", "ms_price_diff_litres", "ms_price_difference", "ms_litres", "hsd_old_price", "hsd_new_price", "hsd_opening", "hsd_closing", "hsd_price_diff_litres", "hsd_price_difference", "hsd_litres", "sales", "cash", "phone_pay", "credit", "beta", "miscellaneous", "shortage_excess"])}</section>
     <section class="table-card"><div class="table-card-head"><div><h2>Payment Log Summary</h2><p>Payments logged during active shifts by pump and type.</p></div></div>${tableColumns(paymentRows, ["business_date", "pump", "team_member", "payment_type", "amount", "entries"])}</section>`));
 });
 
