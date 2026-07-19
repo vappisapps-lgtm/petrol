@@ -969,7 +969,9 @@ async function activePumpGroups(req) {
 
 async function dashboardMetrics() {
   const day = await activeDay();
-  if (!day) return { day: null };
+  const latestClosedDay = await previousClosedDay();
+  const latestDayReport = latestClosedDay ? await dayReportRows(latestClosedDay.id) : null;
+  if (!day) return { day: null, latestClosedDay, latestDayReport };
   const totals = await one(
     `SELECT COALESCE(SUM(sales_amount),0) sales, COALESCE(SUM(cash),0) cash,
      COALESCE(SUM(upi),0) upi, COALESCE(SUM(card),0) card, COALESCE(SUM(credit),0) credit,
@@ -983,6 +985,8 @@ async function dashboardMetrics() {
   );
   return {
     day,
+    latestClosedDay,
+    latestDayReport,
     totals,
     open_shifts: (await one(
       `SELECT COUNT(DISTINCT p.id) c
@@ -1311,12 +1315,14 @@ app.get("/logout", async (req, res) => {
 app.get("/", requireLogin, async (req, res) => {
   const metrics = await dashboardMetrics();
   if (!metrics.day) {
+    const closedDayReport = renderDayReport(metrics.latestClosedDay, metrics.latestDayReport);
     return res.send(
       layout(
         req,
         "Dashboard",
         `${pageHead(`Welcome Back, ${req.user.name}`, "Home > Dashboard")}
-        <section class="empty-state"><h2>No open business day</h2><p>Start the day with product prices and opening dips before pump entries begin.</p><a class="primary link-button" href="/day/start">Start Day</a></section>`
+        <section class="empty-state"><h2>No open business day</h2><p>Start a new business day when ready.</p><a class="primary link-button" href="/day/start">Start Day</a></section>
+        ${closedDayReport || '<section class="table-card"><div class="table-card-head"><div><h2>Day Report</h2><p>No closed day report is available yet.</p></div></div><div class="empty-state"><h2>No closed day</h2><p>Close a business day to see the owner account report here.</p></div></section>'}`
       )
     );
   }
@@ -1355,6 +1361,7 @@ app.get("/", requireLogin, async (req, res) => {
         <div class="panel"><div class="panel-title"><h2>Payment Split</h2></div>${m.payment_totals.map((r) => `<div class="ledger-line"><span>${esc(r.payment_type || "Unsorted")}</span><strong>${rs(r.amount)}</strong></div>`).join("") || '<p class="muted">No shift payments logged yet.</p>'}</div>
         <div class="panel"><div class="panel-title"><h2>Top Credit Customers</h2></div>${m.top_customers.map((c) => `<div class="ledger-line"><span>${esc(c.name)}</span><strong>${rs(c.balance)}</strong></div>`).join("") || '<p class="muted">No pending customer credit.</p>'}</div>
         <div class="panel wide"><div class="panel-title"><h2>Day Opening Readings</h2><span class="badge">${esc(m.day.business_date)}</span></div>${table(openingRows)}</div>
+        ${renderDayReport(m.latestClosedDay, m.latestDayReport)}
         <div class="panel wide"><div class="panel-title"><h2>Open Shift Records</h2><span class="badge">${esc(m.open_shifts)} open</span></div>${tableColumns(openEntries, ["business_date", "pump", "user_name", "ms_opening", "hsd_opening", "status"])}</div>
         <div class="panel wide"><div class="panel-title"><h2>Salesperson-wise Sales</h2></div>${tableColumns(m.boy_sales, ["person", "login_id", "pump", "ms_litres", "hsd_litres", "sales"])}</div>
       </section>`
@@ -1536,6 +1543,92 @@ async function dayOpeningRows(dayId) {
     if (row.product === "HSD") item.hsd_opening = row.opening_meter;
   }
   return Array.from(grouped.values());
+}
+
+async function dayReportRows(dayId) {
+  const rows = await all(
+    `SELECT d.business_date, d.ms_price, d.hsd_price, p.id pump_id, p.name pump, n.product,
+     dnr.opening_meter, dnr.closing_meter
+     FROM day_nozzle_readings dnr
+     JOIN days d ON d.id=dnr.day_id
+     JOIN nozzles n ON n.id=dnr.nozzle_id
+     JOIN pumps p ON p.id=n.pump_id
+     WHERE d.id=?
+     ORDER BY ${pumpOrderSql("p")}, n.product, n.name`,
+    [dayId]
+  );
+  const grouped = new Map();
+  for (const row of rows) {
+    if (!grouped.has(row.pump_id)) {
+      grouped.set(row.pump_id, {
+        business_date: row.business_date,
+        ms_price: Number(row.ms_price || 0),
+        hsd_price: Number(row.hsd_price || 0),
+        pump: row.pump,
+        ms_opening: "",
+        ms_closing: "",
+        ms_litres: 0,
+        ms_sales: 0,
+        hsd_opening: "",
+        hsd_closing: "",
+        hsd_litres: 0,
+        hsd_sales: 0,
+        total_sales: 0,
+      });
+    }
+    const item = grouped.get(row.pump_id);
+    const opening = Number(row.opening_meter || 0);
+    const closing = row.closing_meter == null || row.closing_meter === "" ? null : Number(row.closing_meter);
+    const sold = closing == null ? 0 : litres(closing - opening);
+    if (row.product === "MS") {
+      item.ms_opening = opening;
+      item.ms_closing = closing ?? "";
+      item.ms_litres = sold;
+      item.ms_sales = money(sold * item.ms_price);
+    }
+    if (row.product === "HSD") {
+      item.hsd_opening = opening;
+      item.hsd_closing = closing ?? "";
+      item.hsd_litres = sold;
+      item.hsd_sales = money(sold * item.hsd_price);
+    }
+    item.total_sales = money(Number(item.ms_sales || 0) + Number(item.hsd_sales || 0));
+  }
+  return Array.from(grouped.values());
+}
+
+function renderDayReport(day, rows) {
+  if (!day || !rows || !rows.length) return "";
+  const totals = rows.reduce(
+    (acc, row) => {
+      acc.ms_litres = litres(acc.ms_litres + Number(row.ms_litres || 0));
+      acc.ms_sales = money(acc.ms_sales + Number(row.ms_sales || 0));
+      acc.hsd_litres = litres(acc.hsd_litres + Number(row.hsd_litres || 0));
+      acc.hsd_sales = money(acc.hsd_sales + Number(row.hsd_sales || 0));
+      acc.total_sales = money(acc.total_sales + Number(row.total_sales || 0));
+      return acc;
+    },
+    { ms_litres: 0, ms_sales: 0, hsd_litres: 0, hsd_sales: 0, total_sales: 0 }
+  );
+  const fmtNum = (value) => (value === "" || value == null ? "" : litres(value).toFixed(3).replace(/\.?0+$/, ""));
+  const rowHtml = rows.map((row) => `
+    <tr>
+      <td><strong>${esc(row.pump)}</strong></td>
+      <td>${esc(fmtNum(row.ms_opening))}</td>
+      <td>${esc(fmtNum(row.ms_closing))}</td>
+      <td>${esc(fmtNum(row.ms_litres))}</td>
+      <td>${esc(rs(row.ms_sales))}</td>
+      <td>${esc(fmtNum(row.hsd_opening))}</td>
+      <td>${esc(fmtNum(row.hsd_closing))}</td>
+      <td>${esc(fmtNum(row.hsd_litres))}</td>
+      <td>${esc(rs(row.hsd_sales))}</td>
+      <td><strong>${esc(rs(row.total_sales))}</strong></td>
+    </tr>`).join("");
+  return `<section class="table-card"><div class="table-card-head"><div><h2>Day Report</h2><p>Owner account for ${esc(day.business_date)}. Independent of shifts and salespeople.</p></div><span class="badge">${esc(day.status)}</span></div>
+    <div class="table-wrap"><table>
+      <thead><tr><th>Pump</th><th>MS opening</th><th>MS closing</th><th>MS litres</th><th>MS sales (${esc(money(day.ms_price).toFixed(2))})</th><th>HSD opening</th><th>HSD closing</th><th>HSD litres</th><th>HSD sales (${esc(money(day.hsd_price).toFixed(2))})</th><th>Total sales</th></tr></thead>
+      <tbody>${rowHtml}<tr><td><strong>Total</strong></td><td></td><td></td><td><strong>${esc(fmtNum(totals.ms_litres))}</strong></td><td><strong>${esc(rs(totals.ms_sales))}</strong></td><td></td><td></td><td><strong>${esc(fmtNum(totals.hsd_litres))}</strong></td><td><strong>${esc(rs(totals.hsd_sales))}</strong></td><td><strong>${esc(rs(totals.total_sales))}</strong></td></tr></tbody>
+    </table></div></section>`;
 }
 
 async function renderDayStart(req, res, values = {}, error = "") {
