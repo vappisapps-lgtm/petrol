@@ -6,6 +6,8 @@ const session = require("express-session");
 const initSqlJs = require("sql.js");
 const mysql = require("mysql2/promise");
 
+process.env.TZ = process.env.TZ || "Asia/Kolkata";
+
 const BASE_DIR = __dirname;
 const LEGACY_DATABASE = path.join(BASE_DIR, "petrol_station.sqlite3");
 const DEFAULT_DATA_DIR =
@@ -23,6 +25,7 @@ const MYSQL_CONFIG = {
   user: process.env.DB_USER,
   password: process.env.DB_PASSWORD,
   dateStrings: true,
+  timezone: "+05:30",
   waitForConnections: true,
   connectionLimit: Number(process.env.DB_POOL_LIMIT || 5),
 };
@@ -599,8 +602,27 @@ function litres(value) {
   return Math.round(Number(value || 0) * 1000) / 1000;
 }
 
+function istParts(date = new Date()) {
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Asia/Kolkata",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  }).formatToParts(date);
+  return Object.fromEntries(parts.map((part) => [part.type, part.value]));
+}
+
 function todayIso() {
-  return new Date().toISOString().slice(0, 10);
+  const parts = istParts();
+  return `${parts.year}-${parts.month}-${parts.day}`;
+}
+
+function nowTimeIst() {
+  const parts = istParts();
+  return `${parts.hour}:${parts.minute}`;
 }
 
 function esc(value) {
@@ -675,7 +697,7 @@ function inlineError(message) {
 async function detectShift(timeStr) {
   const shifts = await all("SELECT * FROM shift_defs WHERE status='Active' ORDER BY start_time");
   if (!shifts.length) return null;
-  const now = timeStr || new Date().toTimeString().slice(0, 5);
+  const now = timeStr || nowTimeIst();
   for (const shift of shifts) {
     if (shift.end_time < shift.start_time) {
       if (now >= shift.start_time || now <= shift.end_time) return shift;
@@ -698,7 +720,7 @@ function addDaysIso(dateIso, days) {
 }
 
 function timestampForBusinessTime(businessDate, timeValue) {
-  const time = String(timeValue || new Date().toTimeString().slice(0, 5)).slice(0, 5);
+  const time = String(timeValue || nowTimeIst()).slice(0, 5);
   const date = timeMinutes(time) < timeMinutes("06:00") ? addDaysIso(businessDate, 1) : businessDate;
   return `${date} ${time}:00`;
 }
@@ -2033,7 +2055,7 @@ async function renderShiftStart(req, res, values = {}, error = "") {
       ${inlineError(error)}
       <label class="field"><span>Pump</span><select name="pump_id" onchange="if(!this.selectedOptions[0].disabled) window.location='/shift/start?pump_id='+this.value">${pumps.map((p) => optionDisabled(p.id, activePumpIds.has(Number(p.id)) ? `${p.name} - active` : p.name, selectedPumpId, activePumpIds.has(Number(p.id)))).join("")}</select></label>
       <label class="field"><span>Team member</span><select name="user_id">${users.map((u) => optionDisabled(u.id, activeUserIds.has(Number(u.id)) ? `${u.name} - assigned` : u.name, selectedUserId, activeUserIds.has(Number(u.id)))).join("")}</select></label>
-      <label class="field"><span>Time in</span><input name="time_in" type="time" value="${esc(fieldValue(values, "time_in", new Date().toTimeString().slice(0, 5)))}"></label>
+      <label class="field"><span>Time in</span><input name="time_in" type="time" value="${esc(fieldValue(values, "time_in", nowTimeIst()))}"></label>
       <div class="form-section"><strong>Opening meters</strong><small>Defaults come from the day-start pump readings</small></div>
       <div class="form-section"><strong>${esc(pumps.find((p) => Number(p.id) === selectedPumpId)?.name || "Pump")}</strong><small>MS and HSD readings</small></div>
       ${nozzles.map((n) => {
@@ -2134,7 +2156,7 @@ async function renderPumpPayments(req, res, pump, entries, values = {}, error = 
       <label class="field"><span>Salesperson</span><input value="${esc(assigned)}" readonly></label>
       <label class="field"><span>Payment type</span><select name="payment_type">${PAYMENT_TYPES.map((p) => option(p, p, fieldValue(values, "payment_type", ""))).join("")}</select></label>
       <label class="field"><span>Amount</span><input name="amount" type="number" step="0.01" value="${esc(fieldValue(values, "amount", ""))}" required></label>
-      <label class="field"><span>Time</span><input name="recorded_at" type="time" value="${esc(fieldValue(values, "recorded_at", new Date().toTimeString().slice(0, 5)))}"></label>
+      <label class="field"><span>Time</span><input name="recorded_at" type="time" value="${esc(fieldValue(values, "recorded_at", nowTimeIst()))}"></label>
       <label class="field" id="creditCustomerField"><span>Credit customer</span><select name="customer_id"><option value="">None</option>${customers.map((c) => option(c.id, c.name, fieldValue(values, "customer_id", ""))).join("")}</select><small>Needed only for Credit.</small></label>
       <label class="field"><span>Note</span><input name="note" value="${esc(fieldValue(values, "note", ""))}"></label>
       <div class="action-row"><a class="secondary link-button" href="/shifts/active">Back</a><button class="primary">Add Payment</button></div>
@@ -2308,7 +2330,7 @@ async function renderShiftClose(req, res, values = {}, error = "") {
       <div class="form-section"><strong>${esc(selectedPump?.pump || "Pump")} opening readings</strong><small>Captured when the shift started.</small></div>
       <label class="field"><span>MS opening meter</span><input value="${esc(selectedPump?.ms_opening ?? "")}" readonly></label>
       <label class="field"><span>HSD opening meter</span><input value="${esc(selectedPump?.hsd_opening ?? "")}" readonly></label>
-      <label class="field"><span>Time out</span><input name="time_out" type="time" value="${esc(fieldValue(values, "time_out", new Date().toTimeString().slice(0, 5)))}"></label>
+      <label class="field"><span>Time out</span><input name="time_out" type="time" value="${esc(fieldValue(values, "time_out", nowTimeIst()))}"></label>
       <div class="form-section"><strong>${esc(selectedPump?.pump || "Pump")} closing meters</strong><small>Close MS and HSD together for this pump.</small></div>
       <label class="field"><span>MS closing meter</span><input name="closing_MS" type="number" step="0.001" value="${esc(fieldValue(values, "closing_MS", selectedPump?.ms_closing || ""))}" required></label>
       <label class="field"><span>HSD closing meter</span><input name="closing_HSD" type="number" step="0.001" value="${esc(fieldValue(values, "closing_HSD", selectedPump?.hsd_closing || ""))}" required></label>
@@ -2757,6 +2779,9 @@ app.get("/health", async (_req, res) => {
   res.json({
     ok: true,
     runtime: "node",
+    timezone: "Asia/Kolkata",
+    current_date: todayIso(),
+    current_time: nowTimeIst(),
     database: USING_MYSQL ? MYSQL_CONFIG.database : path.basename(DATABASE),
     database_dir: USING_MYSQL ? MYSQL_CONFIG.host : path.dirname(DATABASE),
     database_source: USING_MYSQL ? "mysql" : process.env.PETROL_DB ? "PETROL_DB" : process.env.PETROL_DATA_DIR ? "PETROL_DATA_DIR" : "default_persistent",
@@ -2769,6 +2794,7 @@ async function start() {
       throw new Error("MySQL is enabled, but DB_NAME, DB_USER, or DB_PASSWORD is missing.");
     }
     mysqlPool = await mysql.createPool(MYSQL_CONFIG);
+    await mysqlPool.query("SET time_zone = '+05:30'");
     db = mysqlPool;
   } else {
     const SQL = await initSqlJs();
