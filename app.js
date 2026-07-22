@@ -628,6 +628,11 @@ function todayIso() {
   return `${parts.year}-${parts.month}-${parts.day}`;
 }
 
+async function nextBusinessDate() {
+  const row = await one("SELECT business_date FROM days ORDER BY business_date DESC LIMIT 1");
+  return row ? addDaysIso(row.business_date, 1) : todayIso();
+}
+
 function nowTimeIst() {
   const parts = istParts();
   return `${parts.hour}:${parts.minute}`;
@@ -1996,7 +2001,8 @@ async function renderDayStart(req, res, values = {}, error = "") {
      ORDER BY CASE WHEN p.name GLOB 'Pump [0-9]*' THEN CAST(SUBSTR(p.name, 6) AS INTEGER) ELSE 999999 END, p.name`
   );
   const currentDay = await activeDay();
-  const selectedDate = fieldValue(values, "business_date", currentDay?.business_date || todayIso());
+  const expectedDate = currentDay?.business_date || await nextBusinessDate();
+  const selectedDate = fieldValue(values, "business_date", expectedDate);
   const editMode = Boolean(currentDay) && req.query.edit === "1";
   const lockedOpenDay = Boolean(currentDay) && !editMode;
   const dayStartActions = currentDay
@@ -2024,7 +2030,7 @@ async function renderDayStart(req, res, values = {}, error = "") {
       ${inlineError(error)}
       ${lockedOpenDay ? '<div class="flash warning span-2">A business day is already open. Details are locked. Click Edit to make corrections.</div>' : ""}
       ${editMode ? '<div class="flash warning span-2">Editing the open business day. Save only correction changes.</div>' : ""}
-      <label class="field"><span>Business date / sales date</span><input name="business_date" type="date" value="${esc(selectedDate)}" ${currentDay ? "readonly" : ""} required><small>Opening readings come only from the previous closed day.</small></label>
+      <label class="field"><span>Business date / sales date</span><input name="business_date" type="date" value="${esc(selectedDate)}" readonly required><small>Automatically continues after the latest closed business day.</small></label>
       <label class="field"><span>MS price</span><input name="ms_price" type="number" step="0.01" value="${esc(fieldValue(values, "ms_price", currentDay?.ms_price || ""))}" ${readonlyAttr} required></label>
       <label class="field"><span>HSD price</span><input name="hsd_price" type="number" step="0.01" value="${esc(fieldValue(values, "hsd_price", currentDay?.hsd_price || ""))}" ${readonlyAttr} required></label>
       <div class="form-section"><strong>Pump opening meter readings</strong><small>Previous closing readings for this business date.</small></div>
@@ -2059,6 +2065,11 @@ app.route("/day/start")
   })
   .post(requireLogin, requireRoles("admin", "manager"), async (req, res) => {
     const b = req.body;
+    const currentOpenDay = await activeDay();
+    const expectedDate = currentOpenDay?.business_date || await nextBusinessDate();
+    if (String(b.business_date || "") !== expectedDate) {
+      return await renderDayStart(req, res, { ...b, business_date: expectedDate }, `Business date must be ${expectedDate}. Closed days cannot be started again.`);
+    }
     const existingDay = await one("SELECT * FROM days WHERE business_date=?", [b.business_date]);
     if (existingDay && existingDay.status !== "Open") {
       return await renderDayStart(req, res, b, "This day is already closed.");
@@ -2827,6 +2838,7 @@ app.route("/day/close")
         row.hsd_closing = r.closing_meter ?? "";
       }
     }
+    const closingDate = addDaysIso(day.business_date, 1);
     const closingInputs = Array.from(grouped.values()).map((p) => `
       <div class="form-section"><strong>${esc(p.pump)}</strong><small>Final day closing readings</small></div>
       <label class="field"><span>MS opening</span><input value="${esc(p.ms_opening)}" readonly></label>
@@ -2837,6 +2849,7 @@ app.route("/day/close")
     res.send(layout(req, "Day Closing", `${pageHead("Day Closing", "Operations > Day Closing")}
       <section class="stat-grid"><div class="stat"><span>Open shifts info</span><strong>${esc(openCount)}</strong><small>Day closing is independent</small></div><div class="stat"><span>Sales</span><strong>${rs(metrics.totals.sales)}</strong></div><div class="stat"><span>Cash</span><strong>${rs(metrics.totals.cash)}</strong></div><div class="stat"><span>Credit</span><strong>${rs(metrics.totals.credit)}</strong></div></section>
       <section class="form-card"><form method="post" class="grid-form" onsubmit="return confirm('Close this business day? New day openings will use these closing readings.');">
+        <label class="field span-2"><span>Closing date</span><input name="closing_date" type="date" value="${esc(closingDate)}" readonly><small>${esc(day.business_date)} closes on the next calendar day.</small></label>
         ${closingInputs || '<div class="form-error span-2">Start the day and capture pump openings before day closing.</div>'}
         <div class="action-row"><button class="primary">Close Day</button></div>
       </form></section>`));
@@ -2867,7 +2880,8 @@ app.route("/day/close")
       if (r.product === "MS") actualMs += closing;
       if (r.product === "HSD") actualHsd += closing;
     }
-    await run("UPDATE days SET actual_ms=?, actual_hsd=?, actual_cash=?, status='Closed', closed_at=CURRENT_TIMESTAMP WHERE id=?", [litres(actualMs), litres(actualHsd), 0, day.id]);
+    const closingDate = addDaysIso(day.business_date, 1);
+    await run("UPDATE days SET actual_ms=?, actual_hsd=?, actual_cash=?, status='Closed', closed_at=? WHERE id=?", [litres(actualMs), litres(actualHsd), 0, `${closingDate} 06:00:00`, day.id]);
     flash(req, "success", "Day closed and entries locked.");
     res.redirect("/reports");
   });
