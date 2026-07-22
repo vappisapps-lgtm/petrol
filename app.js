@@ -2587,6 +2587,7 @@ async function renderShiftClose(req, res, values = {}, error = "") {
   const openPumps = await activePumpGroups(req);
   const selectedPumpId = Number(fieldValue(values, "pump_id", req.query.pump_id || openPumps[0]?.pump_id || ""));
   const selectedPump = openPumps.find((p) => Number(p.pump_id) === selectedPumpId);
+  const defaultClosingDate = selectedPump?.business_date ? addDaysIso(selectedPump.business_date, 1) : todayIso();
   const loggedTotals = selectedPump ? await getPumpPaymentTotals(selectedPumpId, req) : { cash: 0, phone_pay: 0, credit: 0, miscellaneous: 0, beta: 0, total: 0 };
   const paymentRows = selectedPump ? await getPumpPaymentRows(selectedPumpId, req) : [];
   const priceSplit = selectedPump ? await closeShiftPriceSplit(selectedPumpId, selectedPump.business_date) : {};
@@ -2617,7 +2618,7 @@ async function renderShiftClose(req, res, values = {}, error = "") {
     <section class="form-card"><form method="post" class="grid-form">
       ${inlineError(error)}
       <label class="field span-2"><span>Active pump</span><select name="pump_id" onchange="window.location='/shift/close?pump_id='+this.value">${openPumps.map((p) => option(p.pump_id, `${p.business_date} - ${p.pump} - ${p.user_name}`, selectedPumpId)).join("")}</select></label>
-      <label class="field"><span>Closing date</span><input name="closing_date" type="date" value="${esc(fieldValue(values, "closing_date", todayIso()))}" required></label>
+      <label class="field"><span>Closing date</span><input name="closing_date" type="date" value="${esc(fieldValue(values, "closing_date", defaultClosingDate))}" required><small>Defaults to the next date after the business date.</small></label>
       <label class="field"><span>Time out</span><input name="time_out" type="time" value="${esc(fieldValue(values, "time_out", nowTimeIst()))}"></label>
       <div class="form-section"><strong>${esc(selectedPump?.pump || "Pump")} readings and prices</strong><small>Enter closing readings to preview litres, sales and balance.</small></div>
       <label class="field"><span>MS price</span><input value="${esc(rs(selectedPump?.ms_rate || 0))}" readonly></label>
