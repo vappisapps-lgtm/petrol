@@ -310,16 +310,6 @@ async function initMysqlDb() {
       await db.query(sql);
     } catch (_err) {}
   }
-  await db.query(`
-    INSERT IGNORE INTO day_nozzle_readings(day_id, nozzle_id, opening_meter)
-    SELECT se.day_id, se.nozzle_id, se.opening_meter
-    FROM shift_entries se
-    JOIN (
-      SELECT day_id, nozzle_id, MIN(id) first_entry_id
-      FROM shift_entries
-      GROUP BY day_id, nozzle_id
-    ) firsts ON firsts.first_entry_id=se.id
-  `);
 }
 
 async function initDb() {
@@ -548,16 +538,6 @@ async function initDb() {
       db.exec(sql);
     } catch (_err) {}
   }
-  db.exec(`
-    INSERT OR IGNORE INTO day_nozzle_readings(day_id, nozzle_id, opening_meter)
-    SELECT se.day_id, se.nozzle_id, se.opening_meter
-    FROM shift_entries se
-    JOIN (
-      SELECT day_id, nozzle_id, MIN(id) first_entry_id
-      FROM shift_entries
-      GROUP BY day_id, nozzle_id
-    ) firsts ON firsts.first_entry_id=se.id
-  `);
   persistDb();
   dbInitialized = true;
 }
@@ -2987,7 +2967,6 @@ app.route("/shift/close")
         ]
       );
       await run("UPDATE tanks SET current_stock=current_stock-? WHERE id=?", [item.sold, item.entry.tank_id]);
-      await saveDayNozzleReading(item.entry.day_id, item.entry.nozzle_id, Number(item.entry.opening_meter), item.closing);
     }
     const dueAmount = shortage < -0.01 ? money(Math.abs(shortage)) : 0;
     if (dueAmount && req.body.record_salesperson_due) {
@@ -3295,6 +3274,13 @@ app.get("/reports", requireLogin, async (req, res) => {
      ORDER BY sd.business_date DESC, ${pumpOrderSql("p")}, u.name, sd.id DESC`,
     [start, end, ...(pumpId ? [Number(pumpId)] : []), ...(userId ? [Number(userId)] : [])]
   );
+  const dueSummary = await one(
+    `SELECT COALESCE(SUM(sd.amount),0) amount
+     FROM salesperson_dues sd
+     JOIN pumps p ON p.id=sd.pump_id
+     WHERE sd.status='Open' AND sd.business_date BETWEEN ? AND ? ${pumpId ? " AND p.id=?" : ""}${userId ? " AND sd.user_id=?" : ""}`,
+    [start, end, ...(pumpId ? [Number(pumpId)] : []), ...(userId ? [Number(userId)] : [])]
+  );
   const salesmanRowsRaw = await all(
     `SELECT se.business_date, p.id pump_id, p.name pump, u.name team_member,
      MIN(se.opened_at) opened_at, MAX(se.closed_at) closed_at,
@@ -3326,6 +3312,8 @@ app.get("/reports", requireLogin, async (req, res) => {
     time_out: clockFromTimestamp(row.closed_at),
   }, priceByDate, dayClosingByKey));
   const collectionTotal = money(Number(summary.cash || 0) + Number(summary.upi || 0) + Number(summary.beta || 0) + Number(summary.miscellaneous || 0));
+  const salespersonDueTotal = money(dueSummary?.amount || 0);
+  const totalDues = money(Number(summary.credit || 0) + salespersonDueTotal);
   res.send(layout(req, "Reports", `${pageHead("Reports", "Operations > Reports", '<a class="link-button" href="/export/shifts.csv">Export CSV</a>')}
     <section class="form-card"><form method="get" class="grid-form">
       <label class="field"><span>Start</span><input name="start" type="date" value="${esc(start)}"></label>
@@ -3334,7 +3322,7 @@ app.get("/reports", requireLogin, async (req, res) => {
       ${req.user.role === "pump_boy" ? "" : `<label class="field"><span>Salesperson</span><select name="user_id"><option value="">All salespeople</option>${users.map((u) => option(u.id, u.name, userId)).join("")}</select></label>`}
       <div class="action-row"><button class="primary">Filter</button></div>
     </form></section>
-    <section class="stat-grid"><div class="stat hero"><span>Total sales</span><strong>${rs(summary.sales)}</strong><small>${esc(start)} to ${esc(end)}</small></div><div class="stat"><span>MS / HSD litres</span><strong>${ltr(summary.ms_litres)} / ${ltr(summary.hsd_litres)}</strong></div><div class="stat"><span>Collections</span><strong>${rs(collectionTotal)}</strong><small>Cash + Phone Pay + misc/beta</small></div><div class="stat"><span>Dues / Credit</span><strong>${rs(summary.credit)}</strong></div><div class="stat"><span>Shortage</span><strong>${rs(summary.shortage)}</strong></div></section>
+    <section class="stat-grid"><div class="stat hero"><span>Total sales</span><strong>${rs(summary.sales)}</strong><small>${esc(start)} to ${esc(end)}</small></div><div class="stat"><span>MS / HSD litres</span><strong>${ltr(summary.ms_litres)} / ${ltr(summary.hsd_litres)}</strong></div><div class="stat"><span>Collections</span><strong>${rs(collectionTotal)}</strong><small>Cash + Phone Pay + misc/beta</small></div><div class="stat"><span>Dues / Credit</span><strong>${rs(totalDues)}</strong><small>Customer ${rs(summary.credit)} + salesperson ${rs(salespersonDueTotal)}</small></div><div class="stat"><span>Shortage</span><strong>${rs(summary.shortage)}</strong></div></section>
     ${dayReportTables || '<section class="table-card"><div class="table-card-head"><div><h2>Day Report</h2><p>No day report is available for this date range.</p></div></div><div class="table-wrap"><table><thead><tr><th>Records</th></tr></thead><tbody><tr><td>No records yet.</td></tr></tbody></table></div></section>'}
     ${renderShiftAccountability(shifts, "Shift Level Report")}
     <section class="table-card"><div class="table-card-head"><div><h2>Complete Pump Sales Data</h2><p>Detailed pump-wise readings, prices, 6AM split and collections.</p></div></div>${tableColumns(shifts, ["business_date", "pump", "team_member", "shift", "time_in", "time_out", "ms_old_price", "ms_new_price", "ms_opening", "ms_closing", "ms_before_6_litres", "ms_after_6_litres", "ms_price_difference", "ms_litres", "hsd_old_price", "hsd_new_price", "hsd_opening", "hsd_closing", "hsd_before_6_litres", "hsd_after_6_litres", "hsd_price_difference", "hsd_litres", "sales", "cash", "phone_pay", "credit", "beta", "miscellaneous", "expenses", "shortage_excess", "status"])}</section>
