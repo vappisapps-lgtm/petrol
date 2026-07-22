@@ -270,11 +270,13 @@ const MYSQL_SCHEMA = [
     pump_nozzle VARCHAR(255),
     team_member VARCHAR(255),
     shift_entry_id INT,
+    shift_payment_id INT,
     payment_mode VARCHAR(50),
     notes TEXT,
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     INDEX (customer_id),
-    INDEX (shift_entry_id)
+    INDEX (shift_entry_id),
+    INDEX (shift_payment_id)
   )`,
 ];
 
@@ -287,6 +289,7 @@ async function initMysqlDb() {
     "ALTER TABLE shift_payments ADD COLUMN product VARCHAR(20)",
     "ALTER TABLE shift_payments ADD COLUMN payment_type VARCHAR(50)",
     "ALTER TABLE shift_payments ADD COLUMN amount DECIMAL(14,2) DEFAULT 0",
+    "ALTER TABLE credit_ledger ADD COLUMN shift_payment_id INT",
   ]) {
     try {
       await db.query(sql);
@@ -500,6 +503,7 @@ async function initDb() {
       pump_nozzle TEXT,
       team_member TEXT,
       shift_entry_id INTEGER REFERENCES shift_entries(id),
+      shift_payment_id INTEGER REFERENCES shift_payments(id),
       payment_mode TEXT,
       notes TEXT,
       created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
@@ -512,6 +516,7 @@ async function initDb() {
     "ALTER TABLE shift_payments ADD COLUMN product TEXT",
     "ALTER TABLE shift_payments ADD COLUMN payment_type TEXT",
     "ALTER TABLE shift_payments ADD COLUMN amount REAL DEFAULT 0",
+    "ALTER TABLE credit_ledger ADD COLUMN shift_payment_id INTEGER",
   ]) {
     try {
       db.exec(sql);
@@ -807,11 +812,18 @@ function paymentColumn(paymentType) {
   return null;
 }
 
+function paymentSplit(paymentType, amount) {
+  const values = { cash: 0, upi: 0, card: 0, credit: 0 };
+  const column = paymentColumn(paymentType);
+  if (column) values[column] = amount;
+  return values;
+}
+
 async function getPumpPaymentRows(pumpId, req) {
   const where = req.user.role === "pump_boy" ? "AND se.user_id=?" : "";
   const params = req.user.role === "pump_boy" ? [pumpId, req.user.id] : [pumpId];
-  return await all(
-    `SELECT sp.recorded_at time, p.name pump, u.name salesperson, sp.payment_type, sp.amount, sp.note, c.name customer
+  const rows = await all(
+    `SELECT sp.id, sp.recorded_at time, p.id pump_id, p.name pump, u.name salesperson, sp.payment_type, sp.amount, sp.note, c.name customer
      FROM shift_payments sp
      JOIN shift_entries se ON se.id=sp.shift_entry_id
      JOIN users u ON u.id=se.user_id
@@ -822,6 +834,10 @@ async function getPumpPaymentRows(pumpId, req) {
      ORDER BY sp.recorded_at DESC, sp.id DESC`,
     params
   );
+  return rows.map((row) => ({
+    ...row,
+    actions: `<a class="link-button secondary" href="/shift/payment/${esc(row.id)}/edit">Edit</a>`,
+  }));
 }
 
 async function getPumpPaymentTotals(pumpId, req) {
@@ -2263,7 +2279,7 @@ async function renderPumpPayments(req, res, pump, entries, values = {}, error = 
       <div class="stat"><span>Beta</span><strong>${rs(totals.beta)}</strong></div>
       <div class="stat hero"><span>Total logged</span><strong>${rs(totals.total)}</strong></div>
     </section>
-    <section class="table-card"><div class="table-card-head"><div><h2>Payment Log</h2><p>Each payment is timestamped and linked to this active pump.</p></div></div>${tableColumns(paymentRows, ["time", "pump", "salesperson", "payment_type", "amount", "customer", "note"])}</section>`));
+    <section class="table-card"><div class="table-card-head"><div><h2>Payment Log</h2><p>Each payment is timestamped and linked to this active pump.</p></div></div>${tableColumns(paymentRows, ["time", "pump", "salesperson", "payment_type", "amount", "customer", "note", "actions"])}</section>`));
 }
 
 app.get("/shift/pump/:pumpId/payment", requireLogin, async (req, res) => {
@@ -2303,12 +2319,10 @@ app.post("/shift/pump/:pumpId/payment", requireLogin, async (req, res) => {
   if (!PAYMENT_TYPES.includes(paymentType)) return await renderPumpPayments(req, res, pump, entries, req.body, "Select a valid payment type.");
   if (!amount || amount <= 0) return await renderPumpPayments(req, res, pump, entries, req.body, "Enter payment amount.");
   if (paymentType === "Credit" && !req.body.customer_id) return await renderPumpPayments(req, res, pump, entries, req.body, "Select credit customer for Credit payment.");
-  const column = paymentColumn(paymentType);
-  const values = { cash: 0, upi: 0, card: 0, credit: 0 };
-  if (column) values[column] = amount;
+  const values = paymentSplit(paymentType, amount);
   const businessDate = entry.business_date || todayIso();
   const recordedAt = req.body.recorded_at ? `${businessDate} ${req.body.recorded_at}:00` : undefined;
-  await run(
+  const payment = await run(
     `INSERT INTO shift_payments(shift_entry_id, product, payment_type, amount, cash, upi, card, credit, customer_id, note${recordedAt ? ", recorded_at" : ""})
      VALUES(?,?,?,?,?,?,?,?,?,?${recordedAt ? ", ?" : ""})`,
     [
@@ -2328,12 +2342,105 @@ app.post("/shift/pump/:pumpId/payment", requireLogin, async (req, res) => {
   if (paymentType === "Credit") {
     await run("UPDATE customers SET balance=balance+? WHERE id=?", [amount, Number(req.body.customer_id)]);
     await run(
-      "INSERT INTO credit_ledger(customer_id, business_date, entry_type, product, amount, pump_nozzle, shift_entry_id, notes) VALUES(?,?,?,?,?,?,?,?)",
-      [Number(req.body.customer_id), businessDate, "credit", null, amount, pump.name, entry.id, req.body.note || "Shift credit logged"]
+      "INSERT INTO credit_ledger(customer_id, business_date, entry_type, product, amount, pump_nozzle, shift_entry_id, shift_payment_id, notes) VALUES(?,?,?,?,?,?,?,?,?)",
+      [Number(req.body.customer_id), businessDate, "credit", null, amount, pump.name, entry.id, payment.lastInsertRowid, req.body.note || "Shift credit logged"]
     );
   }
   flash(req, "success", `${paymentType} payment added for ${pump.name}.`);
   res.redirect(`/shift/pump/${pump.id}/payment`);
+});
+
+async function getEditablePayment(paymentId, req) {
+  const where = req.user.role === "pump_boy" ? "AND se.user_id=?" : "";
+  const params = req.user.role === "pump_boy" ? [paymentId, req.user.id] : [paymentId];
+  return await one(
+    `SELECT sp.*, se.business_date, se.user_id, p.id pump_id, p.name pump, u.name salesperson
+     FROM shift_payments sp
+     JOIN shift_entries se ON se.id=sp.shift_entry_id
+     JOIN users u ON u.id=se.user_id
+     JOIN nozzles n ON n.id=se.nozzle_id
+     JOIN pumps p ON p.id=n.pump_id
+     WHERE sp.id=? AND se.status='Open' ${where}
+     LIMIT 1`,
+    params
+  );
+}
+
+async function syncCreditLedgerForPayment(payment, paymentType, amount, customerId, note) {
+  const oldWasCredit = payment.payment_type === "Credit" && payment.customer_id;
+  const newIsCredit = paymentType === "Credit" && customerId;
+  if (oldWasCredit) await run("UPDATE customers SET balance=balance-? WHERE id=?", [money(payment.amount), Number(payment.customer_id)]);
+  if (newIsCredit) await run("UPDATE customers SET balance=balance+? WHERE id=?", [amount, customerId]);
+
+  const existingLedger = await one(
+    `SELECT id FROM credit_ledger
+     WHERE entry_type='credit' AND (shift_payment_id=? OR (shift_payment_id IS NULL AND shift_entry_id=? AND customer_id=? AND amount=?))
+     ORDER BY shift_payment_id DESC, id DESC LIMIT 1`,
+    [payment.id, payment.shift_entry_id, Number(payment.customer_id || 0), money(payment.amount)]
+  );
+  if (newIsCredit && existingLedger) {
+    await run(
+      "UPDATE credit_ledger SET customer_id=?, business_date=?, amount=?, pump_nozzle=?, shift_entry_id=?, shift_payment_id=?, notes=? WHERE id=?",
+      [customerId, payment.business_date, amount, payment.pump, payment.shift_entry_id, payment.id, note || "Shift credit logged", existingLedger.id]
+    );
+  } else if (newIsCredit) {
+    await run(
+      "INSERT INTO credit_ledger(customer_id, business_date, entry_type, product, amount, pump_nozzle, shift_entry_id, shift_payment_id, notes) VALUES(?,?,?,?,?,?,?,?,?)",
+      [customerId, payment.business_date, "credit", null, amount, payment.pump, payment.shift_entry_id, payment.id, note || "Shift credit logged"]
+    );
+  } else if (existingLedger) {
+    await run("DELETE FROM credit_ledger WHERE id=?", [existingLedger.id]);
+  }
+}
+
+async function renderPaymentEdit(req, res, payment, values = {}, error = "") {
+  const customers = await all("SELECT * FROM customers WHERE status='Active' ORDER BY name");
+  const selectedType = fieldValue(values, "payment_type", payment.payment_type || "");
+  res.send(layout(req, "Edit Payment", `${pageHead(`Edit ${payment.pump} Payment`, "Operations > Active Pump")}
+    <section class="form-card"><form method="post" class="grid-form">
+      ${inlineError(error)}
+      <label class="field"><span>Payment type</span><select name="payment_type">${PAYMENT_TYPES.map((p) => option(p, p, selectedType)).join("")}</select></label>
+      <label class="field"><span>Amount</span><input name="amount" type="number" step="0.01" value="${esc(fieldValue(values, "amount", payment.amount || ""))}" required></label>
+      <label class="field"><span>Time</span><input name="recorded_at" type="time" value="${esc(fieldValue(values, "recorded_at", clockFromTimestamp(payment.recorded_at)))}"></label>
+      <label class="field" id="creditCustomerField"><span>Credit customer</span><select name="customer_id"><option value="">None</option>${customers.map((c) => option(c.id, c.name, fieldValue(values, "customer_id", payment.customer_id || ""))).join("")}</select><small>Needed only for Credit.</small></label>
+      <label class="field"><span>Note</span><input name="note" value="${esc(fieldValue(values, "note", payment.note || ""))}"></label>
+      <div class="action-row"><a class="secondary link-button" href="/shift/pump/${esc(payment.pump_id)}/payment">Cancel</a><button class="primary">Save Payment</button></div>
+    </form>
+    <script>
+      const paymentTypeSelect = document.querySelector('select[name="payment_type"]');
+      const creditCustomerField = document.getElementById("creditCustomerField");
+      function toggleCreditCustomer() {
+        creditCustomerField.style.display = paymentTypeSelect.value === "Credit" ? "" : "none";
+      }
+      paymentTypeSelect.addEventListener("change", toggleCreditCustomer);
+      toggleCreditCustomer();
+    </script></section>`));
+}
+
+app.get("/shift/payment/:paymentId/edit", requireLogin, async (req, res) => {
+  const payment = await getEditablePayment(Number(req.params.paymentId), req);
+  if (!payment) return res.redirect("/shifts/active");
+  await renderPaymentEdit(req, res, payment);
+});
+
+app.post("/shift/payment/:paymentId/edit", requireLogin, async (req, res) => {
+  const payment = await getEditablePayment(Number(req.params.paymentId), req);
+  if (!payment) return res.redirect("/shifts/active");
+  const paymentType = String(req.body.payment_type || "").trim();
+  const amount = money(req.body.amount);
+  const customerId = req.body.customer_id ? Number(req.body.customer_id) : null;
+  if (!PAYMENT_TYPES.includes(paymentType)) return await renderPaymentEdit(req, res, payment, req.body, "Select a valid payment type.");
+  if (!amount || amount <= 0) return await renderPaymentEdit(req, res, payment, req.body, "Enter payment amount.");
+  if (paymentType === "Credit" && !customerId) return await renderPaymentEdit(req, res, payment, req.body, "Select credit customer for Credit payment.");
+  const values = paymentSplit(paymentType, amount);
+  const recordedAt = req.body.recorded_at ? `${payment.business_date} ${String(req.body.recorded_at).slice(0, 5)}:00` : payment.recorded_at;
+  await run(
+    "UPDATE shift_payments SET payment_type=?, amount=?, cash=?, upi=?, card=?, credit=?, customer_id=?, note=?, recorded_at=? WHERE id=?",
+    [paymentType, amount, values.cash, values.upi, values.card, values.credit, customerId, req.body.note || "", recordedAt, payment.id]
+  );
+  await syncCreditLedgerForPayment(payment, paymentType, amount, customerId, req.body.note || "");
+  flash(req, "success", "Payment updated.");
+  res.redirect(`/shift/pump/${payment.pump_id}/payment`);
 });
 
 async function renderPumpShiftEdit(req, res, pump, entries, values = {}, error = "") {
@@ -2428,7 +2535,7 @@ async function renderShiftClose(req, res, values = {}, error = "") {
       <label class="field span-2"><span>Remarks</span><textarea name="remarks">${esc(fieldValue(values, "remarks", ""))}</textarea></label>
       <div class="action-row"><button class="primary" ${openPumps.length ? "" : "disabled"}>Close Pump</button></div>
     </form></section>
-    <section class="table-card"><div class="table-card-head"><div><h2>Logged Payments</h2><p>These payments will be used for closing tally.</p></div></div>${tableColumns(paymentRows, ["time", "pump", "salesperson", "payment_type", "amount", "customer", "note"])}</section>
+    <section class="table-card"><div class="table-card-head"><div><h2>Logged Payments</h2><p>These payments will be used for closing tally.</p></div></div>${tableColumns(paymentRows, ["time", "pump", "salesperson", "payment_type", "amount", "customer", "note", "actions"])}</section>
     <section class="table-card">${tableColumns(openPumps, ["business_date", "pump", "user_name", "shift_name", "time_in", "ms_opening", "hsd_opening", "status"])}</section>`));
 }
 
