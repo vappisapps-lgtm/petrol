@@ -1263,7 +1263,6 @@ app.get("/setup", async (req, res) => {
         <label class="field"><span>Location</span><input name="location"></label>
         <label class="field"><span>Contact / login ID</span><input name="contact"></label>
         <label class="field span-2"><span>Address</span><textarea name="address"></textarea></label>
-        <label class="field"><span>Default testing litres</span><input name="default_testing_qty" type="number" step="0.001" value="5"></label>
         <label class="field"><span>Password</span><input name="password" type="password" required></label>
         <div class="action-row"><button class="primary">Create Station</button></div>
       </form></section>`
@@ -1286,7 +1285,7 @@ app.post("/setup", async (req, res) => {
       req.body.address || "",
       req.body.location || "",
       req.body.contact || "",
-      Number(req.body.default_testing_qty || 5),
+      5,
     ]
   );
   const user = await run("INSERT INTO users(name, mobile, role, password_hash) VALUES(?,?,?,?)", [
@@ -1547,7 +1546,6 @@ async function masterForm(kind, rows) {
       <label class="field"><span>Username / login ID</span><input name="mobile" required></label>
       <label class="field"><span>Role</span><select name="role">${option("manager", "Manager")}${option("pump_boy", "Pump Boy / Team Member")}${option("admin", "Owner / Admin")}</select></label>
       <label class="field"><span>PIN / password</span><input name="password" type="password" required></label>
-      <label class="field"><span>Assigned pumps</span><input name="assigned_pumps"></label>
       <label class="field"><span>Status</span><select name="status">${option("Active")}${option("Inactive")}</select></label>`;
   } else if (kind === "shifts") {
     fields = `<label class="field"><span>Shift name</span><input name="name" required></label>
@@ -1590,7 +1588,7 @@ app.post("/master/:kind", requireLogin, requireRoles("admin", "manager"), async 
   if (kind === "nozzles") return res.redirect("/master/pumps");
   if (kind === "tanks") await run("INSERT INTO tanks(name, product, capacity, opening_dip, current_stock, status) VALUES(?,?,?,?,?,?)", [b.name, b.product, Number(b.capacity), Number(b.opening_dip || 0), Number(b.current_stock || 0), b.status || "Active"]);
   else if (kind === "pumps") await run("INSERT INTO pumps(name, status) VALUES(?,?)", [b.name, b.status || "Active"]);
-  else if (kind === "team") await run("INSERT INTO users(name, mobile, role, password_hash, status, assigned_pumps) VALUES(?,?,?,?,?,?)", [b.name, b.mobile, b.role, hashWerkzeug(b.password), b.status || "Active", b.assigned_pumps || ""]);
+  else if (kind === "team") await run("INSERT INTO users(name, mobile, role, password_hash, status, assigned_pumps) VALUES(?,?,?,?,?,?)", [b.name, b.mobile, b.role, hashWerkzeug(b.password), b.status || "Active", ""]);
   else if (kind === "shifts") await run("INSERT INTO shift_defs(name, start_time, end_time, description, status) VALUES(?,?,?,?,?)", [b.name, b.start_time, b.end_time, b.description || "", b.status || "Active"]);
   else if (kind === "customers") await run("INSERT INTO customers(name, mobile, vehicle_number, company_name, address, credit_limit, balance, status) VALUES(?,?,?,?,?,?,?,?)", [b.name, b.mobile || "", b.vehicle_number || "", b.company_name || "", b.address || "", Number(b.credit_limit || 0), Number(b.opening_balance || 0), b.status || "Active"]);
   else return res.status(404).send("Not found");
