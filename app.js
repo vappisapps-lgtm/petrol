@@ -912,6 +912,127 @@ async function closeShiftPriceSplit(pumpId, businessDate) {
   };
 }
 
+function shiftGroupKey(row) {
+  return [row.day_id, row.pump_id, row.user_id, normalizeTimestamp(row.opened_at), normalizeTimestamp(row.closed_at || ""), row.status].join("|");
+}
+
+async function repairShiftChainReadings() {
+  const rows = await all(
+    `SELECT se.*, n.pump_id
+     FROM shift_entries se
+     JOIN nozzles n ON n.id=se.nozzle_id
+     ORDER BY se.nozzle_id, se.opened_at, se.id`
+  );
+  const previousByNozzle = new Map();
+  const affectedGroups = new Map();
+  let openingsFixed = 0;
+  let amountsFixed = 0;
+
+  for (const row of rows) {
+    const previous = previousByNozzle.get(Number(row.nozzle_id));
+    if (previous && previous.closing_meter != null && row.opening_meter !== previous.closing_meter) {
+      const expectedOpening = litres(previous.closing_meter);
+      if (Math.abs(Number(row.opening_meter || 0) - expectedOpening) > 0.0005) {
+        await run("UPDATE shift_entries SET opening_meter=? WHERE id=?", [expectedOpening, row.id]);
+        row.opening_meter = expectedOpening;
+        openingsFixed += 1;
+      }
+    }
+    if (row.closing_meter != null) {
+      const sold = litres(Math.max(0, Number(row.closing_meter) - Number(row.opening_meter || 0) - Number(row.testing_qty || 0)));
+      const amount = money(sold * Number(row.rate || 0));
+      if (Math.abs(Number(row.litres_sold || 0) - sold) > 0.0005 || Math.abs(Number(row.sales_amount || 0) - amount) > 0.005) {
+        await run("UPDATE shift_entries SET litres_sold=?, sales_amount=? WHERE id=?", [sold, amount, row.id]);
+        row.litres_sold = sold;
+        row.sales_amount = amount;
+        amountsFixed += 1;
+      }
+      previousByNozzle.set(Number(row.nozzle_id), row);
+    }
+    if (row.status === "Closed" && row.closed_at) affectedGroups.set(shiftGroupKey(row), row);
+  }
+
+  let groupsFixed = 0;
+  let duesUpdated = 0;
+  for (const group of affectedGroups.values()) {
+    const groupRows = await all(
+      `SELECT se.*, n.pump_id
+       FROM shift_entries se
+       JOIN nozzles n ON n.id=se.nozzle_id
+       WHERE se.day_id=? AND n.pump_id=? AND se.user_id=? AND se.opened_at=? AND se.closed_at=? AND se.status='Closed'
+       ORDER BY se.product`,
+      [group.day_id, group.pump_id, group.user_id, normalizeTimestamp(group.opened_at), normalizeTimestamp(group.closed_at)]
+    );
+    if (!groupRows.length) continue;
+    const payments = { cash: 0, upi: 0, credit: 0, beta: 0, miscellaneous: 0 };
+    let expenses = 0;
+    for (const row of groupRows) {
+      const p = await getShiftPaymentsTotal(row.id);
+      payments.cash += Number(p.cash || 0);
+      payments.upi += Number(p.upi || 0);
+      payments.credit += Number(p.credit || 0);
+      payments.beta += Number(p.beta || 0);
+      payments.miscellaneous += Number(p.miscellaneous || 0);
+      expenses += Number(row.expenses || 0);
+    }
+    const totalAmount = money(groupRows.reduce((sum, row) => sum + Number(row.sales_amount || 0), 0));
+    const cash = money(payments.cash);
+    const upi = money(payments.upi);
+    const credit = money(payments.credit);
+    const beta = money(payments.beta);
+    const misc = money(payments.miscellaneous);
+    expenses = money(expenses);
+    const shortage = money(cash + upi + credit + beta + misc + expenses - totalAmount);
+    const share = (value, amount) => (totalAmount > 0 ? money(value * (Number(amount || 0) / totalAmount)) : 0);
+    const allocated = [];
+    for (let i = 0; i < groupRows.length; i += 1) {
+      const row = groupRows[i];
+      const before = allocated.reduce((s, item) => ({
+        cash: money(s.cash + item.cash),
+        upi: money(s.upi + item.upi),
+        credit: money(s.credit + item.credit),
+        beta: money(s.beta + item.beta),
+        misc: money(s.misc + item.misc),
+        expenses: money(s.expenses + item.expenses),
+        shortage: money(s.shortage + item.shortage),
+      }), { cash: 0, upi: 0, credit: 0, beta: 0, misc: 0, expenses: 0, shortage: 0 });
+      const isLast = i === groupRows.length - 1;
+      const item = {
+        cash: isLast ? money(cash - before.cash) : share(cash, row.sales_amount),
+        upi: isLast ? money(upi - before.upi) : share(upi, row.sales_amount),
+        credit: isLast ? money(credit - before.credit) : share(credit, row.sales_amount),
+        beta: isLast ? money(beta - before.beta) : share(beta, row.sales_amount),
+        misc: isLast ? money(misc - before.misc) : share(misc, row.sales_amount),
+        expenses: isLast ? money(expenses - before.expenses) : share(expenses, row.sales_amount),
+        shortage: isLast ? money(shortage - before.shortage) : share(shortage, row.sales_amount),
+      };
+      allocated.push(item);
+      await run(
+        "UPDATE shift_entries SET cash=?, upi=?, credit=?, beta=?, miscellaneous=?, expenses=?, shortage_excess=? WHERE id=?",
+        [item.cash, item.upi, item.credit, item.beta, item.misc, item.expenses, item.shortage, row.id]
+      );
+    }
+    groupsFixed += 1;
+    const due = await one("SELECT id FROM salesperson_dues WHERE shift_entry_id=? ORDER BY id DESC LIMIT 1", [groupRows[0].id]);
+    const dueAmount = shortage < -0.01 ? money(Math.abs(shortage)) : 0;
+    if (due && dueAmount) {
+      await run("UPDATE salesperson_dues SET amount=?, status='Open' WHERE id=?", [dueAmount, due.id]);
+      duesUpdated += 1;
+    } else if (due) {
+      await run("UPDATE salesperson_dues SET amount=0, status='Cleared' WHERE id=?", [due.id]);
+      duesUpdated += 1;
+    } else if (dueAmount) {
+      await run(
+        "INSERT INTO salesperson_dues(business_date, shift_entry_id, user_id, pump_id, amount, note, status) VALUES(?,?,?,?,?,?,?)",
+        [groupRows[0].business_date, groupRows[0].id, groupRows[0].user_id, groupRows[0].pump_id, dueAmount, "Repaired unpaid shift closing balance", "Open"]
+      );
+      duesUpdated += 1;
+    }
+  }
+
+  return { openings_fixed: openingsFixed, amounts_fixed: amountsFixed, groups_rebalanced: groupsFixed, dues_updated: duesUpdated };
+}
+
 async function previousClosedDay(beforeDate = null) {
   const params = beforeDate ? [beforeDate] : [];
   return await one(
@@ -1134,16 +1255,13 @@ async function activePumpGroups(req) {
   return groupPumpEntries(
     await all(
       `SELECT se.id, se.business_date, p.id pump_id, p.name pump, se.product, u.name user_name, sd.name shift_name,
-       COALESCE(dnr.opening_meter, se.opening_meter) opening_meter, se.closing_meter,
-       CASE WHEN se.product='MS' THEN d.ms_price ELSE d.hsd_price END rate,
+       se.opening_meter, se.closing_meter, se.rate,
        se.status, se.opened_at, se.closed_at
        FROM shift_entries se
-       JOIN days d ON d.id=se.day_id
        JOIN users u ON u.id=se.user_id
        JOIN shift_defs sd ON sd.id=se.shift_def_id
        JOIN nozzles n ON n.id=se.nozzle_id
        JOIN pumps p ON p.id=n.pump_id
-       LEFT JOIN day_nozzle_readings dnr ON dnr.day_id=se.day_id AND dnr.nozzle_id=se.nozzle_id
        WHERE se.status='Open' ${where}
        ORDER BY ${pumpOrderSql("p")}, se.product`,
       params
@@ -1521,6 +1639,20 @@ app.post("/admin/mysql-migrate", async (req, res) => {
       <div class="flash error">${esc(err.message)}</div><div class="action-row"><a class="secondary link-button" href="/admin/mysql-migrate">Back</a></div></section></main></body></html>`
     );
   }
+});
+
+app.get("/admin/repair-shift-chain", requireLogin, requireRoles("admin"), async (req, res) => {
+  res.send(layout(req, "Repair Shift Chain", `${pageHead("Repair Shift Chain", "Admin > Repair")}
+    <section class="form-card"><form method="post" class="grid-form" onsubmit="return confirm('Repair shift openings from previous shift closings and rebalance closed shift totals?');">
+      <div class="flash warning span-2">This keeps Day Start/Day Closing separate from Shift Start/Shift Closing. It repairs shift openings from the previous shift closing for the same nozzle, then recalculates litres, sales, shortage/excess and salesperson dues.</div>
+      <div class="action-row"><button class="primary">Run Repair</button></div>
+    </form></section>`));
+});
+
+app.post("/admin/repair-shift-chain", requireLogin, requireRoles("admin"), async (req, res) => {
+  const summary = await repairShiftChainReadings();
+  flash(req, "success", `Repair complete. Openings fixed ${summary.openings_fixed}, amounts fixed ${summary.amounts_fixed}, groups rebalanced ${summary.groups_rebalanced}, dues updated ${summary.dues_updated}.`);
+  res.redirect("/reports");
 });
 
 app.get("/logout", async (req, res) => {
@@ -2199,12 +2331,6 @@ app.route("/day/start")
     for (const nozzle of nozzles) {
       const opening = Number(b[`meter_${nozzle.id}_opening`] ?? b[`nozzle_${nozzle.id}_opening`]);
       await saveDayNozzleReading(dayId, nozzle.id, opening);
-      await run("UPDATE shift_entries SET opening_meter=?, rate=? WHERE day_id=? AND nozzle_id=? AND status='Open'", [
-        opening,
-        nozzle.product === "MS" ? Number(b.ms_price) : Number(b.hsd_price),
-        dayId,
-        nozzle.id,
-      ]);
     }
     for (const p of pumpTesting) {
       await saveDayPumpTesting(dayId, p.pump_id, p.ms_qty, p.hsd_qty);
@@ -2245,7 +2371,7 @@ async function renderShiftStart(req, res, values = {}, error = "") {
     [selectedPumpId]
   );
   for (const nozzle of nozzles) {
-    nozzle.suggested_opening = (await dayOpeningMeter(day.id, nozzle.id)) ?? (await lastMeter(nozzle.id)) ?? 0;
+    nozzle.suggested_opening = (await lastMeter(nozzle.id)) ?? (await dayOpeningMeter(day.id, nozzle.id)) ?? 0;
   }
   const openEntries = (await activePumpGroups(req)).filter((r) => r.business_date === day.business_date);
   res.send(layout(req, "Start Shift", `${pageHead("Start Shift", "Operations > Start Shift")}
@@ -2254,7 +2380,7 @@ async function renderShiftStart(req, res, values = {}, error = "") {
       <label class="field"><span>Pump</span><select name="pump_id" onchange="if(!this.selectedOptions[0].disabled) window.location='/shift/start?pump_id='+this.value">${pumps.map((p) => optionDisabled(p.id, activePumpIds.has(Number(p.id)) ? `${p.name} - active` : p.name, selectedPumpId, activePumpIds.has(Number(p.id)))).join("")}</select></label>
       <label class="field"><span>Team member</span><select name="user_id">${users.map((u) => optionDisabled(u.id, activeUserIds.has(Number(u.id)) ? `${u.name} - assigned` : u.name, selectedUserId, activeUserIds.has(Number(u.id)))).join("")}</select></label>
       <label class="field"><span>Time in</span><input name="time_in" type="time" value="${esc(fieldValue(values, "time_in", nowTimeIst()))}"></label>
-      <div class="form-section"><strong>Opening meters</strong><small>Defaults come from the day-start pump readings</small></div>
+      <div class="form-section"><strong>Opening meters</strong><small>Defaults come from the previous shift closing; day opening is only the first fallback.</small></div>
       <div class="form-section"><strong>${esc(pumps.find((p) => Number(p.id) === selectedPumpId)?.name || "Pump")}</strong><small>MS and HSD readings</small></div>
       ${nozzles.map((n) => {
         const name = `opening_meter_${n.id}`;
@@ -2315,8 +2441,8 @@ app.route("/shift/start")
     let created = 0;
     for (const nozzle of nozzles) {
       let opening = req.body[`opening_meter_${nozzle.id}`];
-      if (opening === "" || opening == null) opening = await dayOpeningMeter(day.id, nozzle.id);
       if (opening === "" || opening == null) opening = await lastMeter(nozzle.id);
+      if (opening === "" || opening == null) opening = await dayOpeningMeter(day.id, nozzle.id);
       if (opening == null) {
         return await renderShiftStart(req, res, req.body, `Enter opening meter for ${nozzle.product}.`);
       }
@@ -2745,24 +2871,16 @@ app.route("/shift/close")
     const where = req.user.role === "pump_boy" ? "AND se.user_id=?" : "";
     const params = req.user.role === "pump_boy" ? [pumpId, req.user.id] : [pumpId];
     const entries = await all(
-      `SELECT se.*, p.name pump, u.name user_name,
-       COALESCE(dnr.opening_meter, se.opening_meter) synced_opening_meter,
-       CASE WHEN se.product='MS' THEN d.ms_price ELSE d.hsd_price END synced_rate
+      `SELECT se.*, p.name pump, u.name user_name
        FROM shift_entries se
-       JOIN days d ON d.id=se.day_id
        JOIN users u ON u.id=se.user_id
        JOIN nozzles n ON n.id=se.nozzle_id
        JOIN pumps p ON p.id=n.pump_id
-       LEFT JOIN day_nozzle_readings dnr ON dnr.day_id=se.day_id AND dnr.nozzle_id=se.nozzle_id
        WHERE p.id=? AND se.status='Open' ${where}
        ORDER BY se.product`,
       params
     );
     if (!entries.length) return await renderShiftClose(req, res, req.body, "Active pump not found.");
-    for (const entry of entries) {
-      entry.opening_meter = entry.synced_opening_meter ?? entry.opening_meter;
-      entry.rate = entry.synced_rate ?? entry.rate;
-    }
     const openedAt = entries.reduce((earliest, entry) => {
       const opened = normalizeTimestamp(entry.opened_at);
       return !earliest || opened < earliest ? opened : earliest;
