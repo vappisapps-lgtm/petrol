@@ -278,6 +278,21 @@ const MYSQL_SCHEMA = [
     INDEX (shift_entry_id),
     INDEX (shift_payment_id)
   )`,
+  `CREATE TABLE IF NOT EXISTS salesperson_dues (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    business_date VARCHAR(20) NOT NULL,
+    shift_entry_id INT NOT NULL,
+    user_id INT NOT NULL,
+    pump_id INT NOT NULL,
+    amount DECIMAL(14,2) NOT NULL,
+    note TEXT,
+    status VARCHAR(50) NOT NULL DEFAULT 'Open',
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    INDEX (business_date),
+    INDEX (user_id),
+    INDEX (pump_id),
+    INDEX (shift_entry_id)
+  )`,
 ];
 
 async function initMysqlDb() {
@@ -506,6 +521,17 @@ async function initDb() {
       shift_payment_id INTEGER REFERENCES shift_payments(id),
       payment_mode TEXT,
       notes TEXT,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
+    CREATE TABLE IF NOT EXISTS salesperson_dues (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      business_date TEXT NOT NULL,
+      shift_entry_id INTEGER NOT NULL REFERENCES shift_entries(id),
+      user_id INTEGER NOT NULL REFERENCES users(id),
+      pump_id INTEGER NOT NULL REFERENCES pumps(id),
+      amount REAL NOT NULL,
+      note TEXT,
+      status TEXT NOT NULL DEFAULT 'Open',
       created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
     );
   `);
@@ -858,6 +884,32 @@ async function getPumpPaymentTotals(pumpId, req) {
     totals.total = money(totals.total + amount);
   }
   return totals;
+}
+
+async function closeShiftPriceSplit(pumpId, businessDate) {
+  const nextDate = addDaysIso(businessDate, 1);
+  const days = await all("SELECT * FROM days WHERE business_date IN (?,?)", [businessDate, nextDate]);
+  const currentDay = days.find((d) => d.business_date === businessDate);
+  const nextDay = days.find((d) => d.business_date === nextDate);
+  const rows = await all(
+    `SELECT n.product, dnr.closing_meter
+     FROM day_nozzle_readings dnr
+     JOIN nozzles n ON n.id=dnr.nozzle_id
+     WHERE dnr.day_id=? AND n.pump_id=?`,
+    [currentDay?.id || 0, pumpId]
+  );
+  const closing = { MS: null, HSD: null };
+  for (const row of rows) closing[row.product] = meterOrNull(row.closing_meter);
+  return {
+    boundaryDate: nextDate,
+    hasBoundaryReadings: closing.MS != null || closing.HSD != null,
+    msBoundary: closing.MS,
+    hsdBoundary: closing.HSD,
+    msOldPrice: money(currentDay?.ms_price || 0),
+    hsdOldPrice: money(currentDay?.hsd_price || 0),
+    msNewPrice: money(nextDay?.ms_price ?? currentDay?.ms_price ?? 0),
+    hsdNewPrice: money(nextDay?.hsd_price ?? currentDay?.hsd_price ?? 0),
+  };
 }
 
 async function previousClosedDay(beforeDate = null) {
@@ -2537,12 +2589,21 @@ async function renderShiftClose(req, res, values = {}, error = "") {
   const selectedPump = openPumps.find((p) => Number(p.pump_id) === selectedPumpId);
   const loggedTotals = selectedPump ? await getPumpPaymentTotals(selectedPumpId, req) : { cash: 0, phone_pay: 0, credit: 0, miscellaneous: 0, beta: 0, total: 0 };
   const paymentRows = selectedPump ? await getPumpPaymentRows(selectedPumpId, req) : [];
+  const priceSplit = selectedPump ? await closeShiftPriceSplit(selectedPumpId, selectedPump.business_date) : {};
   const calcData = {
     msOpening: Number(selectedPump?.ms_opening || 0),
     hsdOpening: Number(selectedPump?.hsd_opening || 0),
     msRate: Number(selectedPump?.ms_rate || 0),
     hsdRate: Number(selectedPump?.hsd_rate || 0),
     loggedTotal: Number(loggedTotals.total || 0),
+    boundaryDate: priceSplit.boundaryDate || "",
+    hasBoundaryReadings: Boolean(priceSplit.hasBoundaryReadings),
+    msBoundary: priceSplit.msBoundary,
+    hsdBoundary: priceSplit.hsdBoundary,
+    msOldPrice: Number(priceSplit.msOldPrice || 0),
+    hsdOldPrice: Number(priceSplit.hsdOldPrice || 0),
+    msNewPrice: Number(priceSplit.msNewPrice || selectedPump?.ms_rate || 0),
+    hsdNewPrice: Number(priceSplit.hsdNewPrice || selectedPump?.hsd_rate || 0),
   };
   res.send(layout(req, "Close Shift", `${pageHead("Close Shift", "Operations > Close Shift")}
     <section class="stat-grid">
@@ -2580,6 +2641,16 @@ async function renderShiftClose(req, res, values = {}, error = "") {
         <div class="stat"><span>Balance to pay</span><strong data-value="balanceDue">Rs. 0.00</strong></div>
         <div class="stat"><span>Shortage / Excess</span><strong data-value="shortageExcess">Rs. 0.00</strong></div>
       </section>
+      <div class="form-section"><strong>6AM price split</strong><small>${priceSplit.hasBoundaryReadings ? `Split point: ${esc(priceSplit.boundaryDate)} 06:00 from day closing readings.` : "Available after day closing readings are saved for this pump."}</small></div>
+      <section class="stat-grid span-2" id="priceSplitCalc">
+        <div class="stat"><span>MS before 6AM</span><strong data-value="msBefore6">0.000 L</strong><small data-value="msOldPrice">Old price</small></div>
+        <div class="stat"><span>MS after 6AM</span><strong data-value="msAfter6">0.000 L</strong><small data-value="msNewPrice">New price</small></div>
+        <div class="stat"><span>HSD before 6AM</span><strong data-value="hsdBefore6">0.000 L</strong><small data-value="hsdOldPrice">Old price</small></div>
+        <div class="stat"><span>HSD after 6AM</span><strong data-value="hsdAfter6">0.000 L</strong><small data-value="hsdNewPrice">New price</small></div>
+        <div class="stat hero"><span>Price difference</span><strong data-value="priceDifference">Rs. 0.00</strong></div>
+      </section>
+      <label class="field span-2"><span><input name="record_salesperson_due" type="checkbox" value="1" checked> Record unpaid balance as salesperson due</span><small>If balance remains unpaid at close, it will appear in reports against this salesperson and date.</small></label>
+      <label class="field span-2"><span>Due note</span><input name="salesperson_due_note" value="${esc(fieldValue(values, "salesperson_due_note", "Unpaid shift closing balance"))}"></label>
       <label class="field span-2"><span>Remarks</span><textarea name="remarks">${esc(fieldValue(values, "remarks", ""))}</textarea></label>
       <div class="action-row"><button class="primary" ${openPumps.length ? "" : "disabled"}>Close Pump</button></div>
     </form>
@@ -2603,6 +2674,15 @@ async function renderShiftClose(req, res, values = {}, error = "") {
           const totalSales = msSales + hsdSales;
           const logged = Number(data.loggedTotal || 0);
           const expenses = number("expenses");
+          let msAfter6 = 0;
+          let hsdAfter6 = 0;
+          if (data.hasBoundaryReadings) {
+            if (data.msBoundary != null) msAfter6 = Math.max(0, number("closing_MS") - Number(data.msBoundary || 0));
+            if (data.hsdBoundary != null) hsdAfter6 = Math.max(0, number("closing_HSD") - Number(data.hsdBoundary || 0));
+          }
+          const msBefore6 = Math.max(0, msLitres - msAfter6);
+          const hsdBefore6 = Math.max(0, hsdLitres - hsdAfter6);
+          const priceDiff = (msAfter6 * (Number(data.msNewPrice || 0) - Number(data.msOldPrice || 0))) + (hsdAfter6 * (Number(data.hsdNewPrice || 0) - Number(data.hsdOldPrice || 0)));
           set("msLitres", ltrFmt(msLitres));
           set("msSales", rsFmt(msSales));
           set("hsdLitres", ltrFmt(hsdLitres));
@@ -2611,6 +2691,15 @@ async function renderShiftClose(req, res, values = {}, error = "") {
           set("loggedPayment", rsFmt(logged));
           set("balanceDue", rsFmt(totalSales - logged));
           set("shortageExcess", rsFmt(logged + expenses - totalSales));
+          set("msBefore6", ltrFmt(msBefore6));
+          set("msAfter6", ltrFmt(msAfter6));
+          set("hsdBefore6", ltrFmt(hsdBefore6));
+          set("hsdAfter6", ltrFmt(hsdAfter6));
+          set("priceDifference", rsFmt(priceDiff));
+          set("msOldPrice", "Old: " + rsFmt(data.msOldPrice));
+          set("msNewPrice", "New: " + rsFmt(data.msNewPrice));
+          set("hsdOldPrice", "Old: " + rsFmt(data.hsdOldPrice));
+          set("hsdNewPrice", "New: " + rsFmt(data.hsdNewPrice));
         }
         ["closing_MS", "closing_HSD", "testing_MS", "testing_HSD", "expenses"].forEach((name) => {
           const input = document.querySelector('[name="' + name + '"]');
@@ -2729,6 +2818,13 @@ app.route("/shift/close")
       );
       await run("UPDATE tanks SET current_stock=current_stock-? WHERE id=?", [item.sold, item.entry.tank_id]);
       await saveDayNozzleReading(item.entry.day_id, item.entry.nozzle_id, Number(item.entry.opening_meter), item.closing);
+    }
+    const dueAmount = shortage < -0.01 ? money(Math.abs(shortage)) : 0;
+    if (dueAmount && req.body.record_salesperson_due) {
+      await run(
+        "INSERT INTO salesperson_dues(business_date, shift_entry_id, user_id, pump_id, amount, note, status) VALUES(?,?,?,?,?,?,?)",
+        [entries[0].business_date, entries[0].id, entries[0].user_id, pumpId, dueAmount, req.body.salesperson_due_note || "Unpaid shift closing balance", "Open"]
+      );
     }
     if (expenses) await run("INSERT INTO expenses(business_date, shift_entry_id, paid_by, category, amount, note, payment_mode) VALUES(?,?,?,?,?,?,?)", [entries[0].business_date, entries[0].id, entries[0].user_id, req.body.expense_category || "Miscellaneous", expenses, req.body.expense_note || "", "Cash"]);
     flash(req, Math.abs(shortage) <= 0.01 ? "success" : "warning", `Pump closed. Sales ${rs(totalAmount)} | Shortage/Excess ${rs(shortage)}`);
@@ -3010,6 +3106,15 @@ app.get("/reports", requireLogin, async (req, res) => {
      ORDER BY se.business_date DESC, ${pumpOrderSql("p")}, u.name, sp.payment_type`,
     params
   );
+  const duesRows = await all(
+    `SELECT sd.business_date, p.name pump, u.name team_member, sd.amount, sd.status, sd.note, sd.created_at
+     FROM salesperson_dues sd
+     JOIN users u ON u.id=sd.user_id
+     JOIN pumps p ON p.id=sd.pump_id
+     WHERE sd.business_date BETWEEN ? AND ? ${pumpId ? " AND p.id=?" : ""}${userId ? " AND sd.user_id=?" : ""}
+     ORDER BY sd.business_date DESC, ${pumpOrderSql("p")}, u.name, sd.id DESC`,
+    [start, end, ...(pumpId ? [Number(pumpId)] : []), ...(userId ? [Number(userId)] : [])]
+  );
   const salesmanRowsRaw = await all(
     `SELECT se.business_date, p.id pump_id, p.name pump, u.name team_member,
      MIN(se.opened_at) opened_at, MAX(se.closed_at) closed_at,
@@ -3054,6 +3159,7 @@ app.get("/reports", requireLogin, async (req, res) => {
     ${renderShiftAccountability(shifts, "Shift Level Report")}
     <section class="table-card"><div class="table-card-head"><div><h2>Complete Pump Sales Data</h2><p>Detailed pump-wise readings, prices, 6AM split and collections.</p></div></div>${tableColumns(shifts, ["business_date", "pump", "team_member", "shift", "time_in", "time_out", "ms_old_price", "ms_new_price", "ms_opening", "ms_closing", "ms_before_6_litres", "ms_after_6_litres", "ms_price_difference", "ms_litres", "hsd_old_price", "hsd_new_price", "hsd_opening", "hsd_closing", "hsd_before_6_litres", "hsd_after_6_litres", "hsd_price_difference", "hsd_litres", "sales", "cash", "phone_pay", "credit", "beta", "miscellaneous", "expenses", "shortage_excess", "status"])}</section>
     <section class="table-card"><div class="table-card-head"><div><h2>Salesperson Date Data</h2><p>Daily readings and totals by pump and team member.</p></div></div>${tableColumns(salesmanRows, ["business_date", "pump", "team_member", "time_in", "time_out", "ms_old_price", "ms_new_price", "ms_opening", "ms_closing", "ms_before_6_litres", "ms_after_6_litres", "ms_price_difference", "ms_litres", "hsd_old_price", "hsd_new_price", "hsd_opening", "hsd_closing", "hsd_before_6_litres", "hsd_after_6_litres", "hsd_price_difference", "hsd_litres", "sales", "cash", "phone_pay", "credit", "beta", "miscellaneous", "shortage_excess"])}</section>
+    <section class="table-card"><div class="table-card-head"><div><h2>Salesperson Dues</h2><p>Unpaid balances recorded during shift closing by person and date.</p></div></div>${tableColumns(duesRows, ["business_date", "pump", "team_member", "amount", "status", "note", "created_at"])}</section>
     <section class="table-card"><div class="table-card-head"><div><h2>Payment Log Summary</h2><p>Payments logged during active shifts by pump and type.</p></div></div>${tableColumns(paymentRows, ["business_date", "pump", "team_member", "payment_type", "amount", "entries"])}</section>`));
 });
 
