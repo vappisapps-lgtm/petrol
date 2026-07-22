@@ -1077,12 +1077,16 @@ async function activePumpGroups(req) {
   return groupPumpEntries(
     await all(
       `SELECT se.id, se.business_date, p.id pump_id, p.name pump, se.product, u.name user_name, sd.name shift_name,
-       se.opening_meter, se.closing_meter, se.rate, se.status, se.opened_at, se.closed_at
+       COALESCE(dnr.opening_meter, se.opening_meter) opening_meter, se.closing_meter,
+       CASE WHEN se.product='MS' THEN d.ms_price ELSE d.hsd_price END rate,
+       se.status, se.opened_at, se.closed_at
        FROM shift_entries se
+       JOIN days d ON d.id=se.day_id
        JOIN users u ON u.id=se.user_id
        JOIN shift_defs sd ON sd.id=se.shift_def_id
        JOIN nozzles n ON n.id=se.nozzle_id
        JOIN pumps p ON p.id=n.pump_id
+       LEFT JOIN day_nozzle_readings dnr ON dnr.day_id=se.day_id AND dnr.nozzle_id=se.nozzle_id
        WHERE se.status='Open' ${where}
        ORDER BY ${pumpOrderSql("p")}, se.product`,
       params
@@ -2115,7 +2119,14 @@ app.route("/day/start")
       }
     }
     for (const nozzle of nozzles) {
-      await saveDayNozzleReading(dayId, nozzle.id, Number(b[`meter_${nozzle.id}_opening`] ?? b[`nozzle_${nozzle.id}_opening`]));
+      const opening = Number(b[`meter_${nozzle.id}_opening`] ?? b[`nozzle_${nozzle.id}_opening`]);
+      await saveDayNozzleReading(dayId, nozzle.id, opening);
+      await run("UPDATE shift_entries SET opening_meter=?, rate=? WHERE day_id=? AND nozzle_id=? AND status='Open'", [
+        opening,
+        nozzle.product === "MS" ? Number(b.ms_price) : Number(b.hsd_price),
+        dayId,
+        nozzle.id,
+      ]);
     }
     for (const p of pumpTesting) {
       await saveDayPumpTesting(dayId, p.pump_id, p.ms_qty, p.hsd_qty);
@@ -2610,16 +2621,24 @@ app.route("/shift/close")
     const where = req.user.role === "pump_boy" ? "AND se.user_id=?" : "";
     const params = req.user.role === "pump_boy" ? [pumpId, req.user.id] : [pumpId];
     const entries = await all(
-      `SELECT se.*, p.name pump, u.name user_name
+      `SELECT se.*, p.name pump, u.name user_name,
+       COALESCE(dnr.opening_meter, se.opening_meter) synced_opening_meter,
+       CASE WHEN se.product='MS' THEN d.ms_price ELSE d.hsd_price END synced_rate
        FROM shift_entries se
+       JOIN days d ON d.id=se.day_id
        JOIN users u ON u.id=se.user_id
        JOIN nozzles n ON n.id=se.nozzle_id
        JOIN pumps p ON p.id=n.pump_id
+       LEFT JOIN day_nozzle_readings dnr ON dnr.day_id=se.day_id AND dnr.nozzle_id=se.nozzle_id
        WHERE p.id=? AND se.status='Open' ${where}
        ORDER BY se.product`,
       params
     );
     if (!entries.length) return await renderShiftClose(req, res, req.body, "Active pump not found.");
+    for (const entry of entries) {
+      entry.opening_meter = entry.synced_opening_meter ?? entry.opening_meter;
+      entry.rate = entry.synced_rate ?? entry.rate;
+    }
     const openedAt = entries.reduce((earliest, entry) => {
       const opened = normalizeTimestamp(entry.opened_at);
       return !earliest || opened < earliest ? opened : earliest;
@@ -2673,10 +2692,12 @@ app.route("/shift/close")
       const allocatedMisc = isLast ? money(misc - calculated.slice(0, i).reduce((a, x) => a + share(misc, x.amount), 0)) : share(misc, item.amount);
       const allocatedShortage = isLast ? money(shortage - calculated.slice(0, i).reduce((a, x) => a + share(shortage, x.amount), 0)) : share(shortage, item.amount);
       await run(
-        `UPDATE shift_entries SET closing_meter=?, litres_sold=?, sales_amount=?, cash=?, upi=?, card=?, credit=?,
+        `UPDATE shift_entries SET opening_meter=?, rate=?, closing_meter=?, litres_sold=?, sales_amount=?, cash=?, upi=?, card=?, credit=?,
          customer_id=?, expenses=?, beta=?, miscellaneous=?, remarks=?, shortage_excess=?, testing_qty=?, status='Closed',
          closed_at=? WHERE id=?`,
         [
+          Number(item.entry.opening_meter),
+          Number(item.entry.rate),
           item.closing,
           item.sold,
           item.amount,
