@@ -1321,8 +1321,22 @@ function table(rows) {
   </tbody></table></div>`;
 }
 
+function columnLabel(key) {
+  const labels = {
+    ms_before_6_l: "MS before 6 AM",
+    ms_after_6_l: "MS after 6 AM",
+    hsd_before_6_l: "HSD before 6 AM",
+    hsd_after_6_l: "HSD after 6 AM",
+    ms_before_6_litres: "MS before 6 AM",
+    ms_after_6_litres: "MS after 6 AM",
+    hsd_before_6_litres: "HSD before 6 AM",
+    hsd_after_6_litres: "HSD after 6 AM",
+  };
+  return labels[key] || key.replaceAll("_", " ");
+}
+
 function tableColumns(rows, keys) {
-  return `<div class="table-wrap"><table><thead><tr>${keys.map((k) => `<th>${esc(k.replaceAll("_", " "))}</th>`).join("")}</tr></thead><tbody>
+  return `<div class="table-wrap"><table><thead><tr>${keys.map((k) => `<th>${esc(columnLabel(k))}</th>`).join("")}</tr></thead><tbody>
     ${rows.length ? rows.map((r) => `<tr>${keys.map((k) => `<td>${k === "actions" ? r[k] : esc(r[k] ?? "")}</td>`).join("")}</tr>`).join("") : `<tr><td colspan="${keys.length}">No records yet.</td></tr>`}
   </tbody></table></div>`;
 }
@@ -1516,14 +1530,15 @@ app.get("/logout", async (req, res) => {
 app.get("/", requireLogin, async (req, res) => {
   const metrics = await dashboardMetrics();
   if (!metrics.day) {
-    const closedDayReport = renderDaySaleSnapshot(metrics.latestClosedDay, metrics.latestDayReport, metrics.previousLatestTotals, "Latest Closed Day Sale");
+    const closedDayTitle = metrics.latestClosedDay ? `${metrics.latestClosedDay.business_date} Sales Account` : "Date Sales Account";
+    const closedDayReport = renderDaySaleSnapshot(metrics.latestClosedDay, metrics.latestDayReport, metrics.previousLatestTotals, closedDayTitle);
     const closedShiftReport = renderShiftWiseSalesReport(metrics.latestClosedDay, metrics.latestShiftWiseReport);
     return res.send(
       layout(
         req,
         "Dashboard",
         `${pageHead(`Welcome Back, ${req.user.name}`, "Home > Dashboard")}
-        ${closedDayReport || '<section class="table-card"><div class="table-card-head"><div><h2>Latest Closed Day Sale</h2><p>No closed day report is available yet.</p></div></div><div class="empty-state"><h2>No closed day</h2><p>Close a business day to see the owner account report here.</p></div></section>'}
+        ${closedDayReport || '<section class="table-card"><div class="table-card-head"><div><h2>Date Sales Account</h2><p>No closed day report is available yet.</p></div></div><div class="empty-state"><h2>No closed day</h2><p>Close a business day to see the owner account report here.</p></div></section>'}
         ${closedShiftReport}
         <section class="empty-state"><h2>No open business day</h2><p>Start a new business day when ready.</p><a class="primary link-button" href="/day/start">Start Day</a></section>`
       )
@@ -1547,12 +1562,12 @@ app.get("/", requireLogin, async (req, res) => {
       "Dashboard",
       `${pageHead(`Welcome Back, ${req.user.name}`, "Home > Dashboard", '<div style="display:flex;gap:8px;"><a class="primary link-button" href="/shift/start">Start Shift</a><a class="link-button" href="/shifts/active">Active Shifts</a></div>')}
       <section class="stat-grid">
-        <div class="stat hero"><span>Shift sales closed today</span><strong>${rs(m.totals.sales)}</strong><small>${esc(m.day.business_date)} | ${esc(m.day.status)}</small></div>
+        <div class="stat hero"><span>${esc(m.day.business_date)} sales account</span><strong>${rs(m.totals.sales)}</strong><small>${esc(m.day.status)}</small></div>
         <div class="stat"><span>MS / HSD litres</span><strong>${ltr(m.totals.ms_litres)} / ${ltr(m.totals.hsd_litres)}</strong><small>Closed shifts only</small></div>
         <div class="stat"><span>Collections</span><strong>${rs(Number(m.totals.cash || 0) + Number(m.totals.upi || 0))}</strong><small>Cash + Phone Pay</small></div>
         <div class="stat"><span>Dues / Open pumps</span><strong>${rs(m.credit_pending)}</strong><small>${esc(m.open_shifts)} open pumps</small></div>
       </section>
-      <section class="table-card"><div class="table-card-head"><div><h2>Current Open Day Readings</h2><p>Opening readings are captured. Final sale values appear after day close.</p></div><span class="badge">${esc(m.day.business_date)}</span></div>${tableColumns(openingRows, ["business_date", "pump", "ms_opening", "ms_closing", "hsd_opening", "hsd_closing"])}</section>
+      <section class="table-card"><div class="table-card-head"><div><h2>${esc(m.day.business_date)} Open Day Readings</h2><p>Opening readings are captured. Final sale values appear after day close.</p></div><span class="badge">${esc(m.day.business_date)}</span></div>${tableColumns(openingRows, ["business_date", "pump", "ms_opening", "ms_closing", "hsd_opening", "hsd_closing"])}</section>
       <section class="table-card"><div class="table-card-head"><div><h2>Active Pump Handover</h2><p>Who is currently responsible for each open pump.</p></div><span class="badge">${esc(m.open_shifts)} open</span></div>${tableColumns(openEntries, ["business_date", "pump", "user_name", "shift_name", "time_in", "ms_opening", "hsd_opening", "status"])}</section>
       <section class="dashboard-grid">
         <div class="panel wide"><div class="panel-title"><h2>Fuel Sales Summary</h2><span class="badge">${esc(m.day.status)}</span></div>
@@ -1566,7 +1581,7 @@ app.get("/", requireLogin, async (req, res) => {
         <div class="panel"><div class="panel-title"><h2>Payment Split</h2></div>${m.payment_totals.map((r) => `<div class="ledger-line"><span>${esc(r.payment_type || "Unsorted")}</span><strong>${rs(r.amount)}</strong></div>`).join("") || '<p class="muted">No shift payments logged yet.</p>'}</div>
         <div class="panel"><div class="panel-title"><h2>Credit / Dues</h2></div>${m.top_customers.map((c) => `<div class="ledger-line"><span>${esc(c.name)}</span><strong>${rs(c.balance)}</strong></div>`).join("") || '<p class="muted">No pending customer credit.</p>'}</div>
         <div class="panel wide"><div class="panel-title"><h2>Salesperson Summary</h2></div>${tableColumns(m.boy_sales, ["person", "login_id", "pump", "ms_litres", "hsd_litres", "sales"])}</div>
-        ${renderDaySaleSnapshot(m.latestClosedDay, m.latestDayReport, m.previousLatestTotals, "Latest Closed Owner Account")}
+        ${renderDaySaleSnapshot(m.latestClosedDay, m.latestDayReport, m.previousLatestTotals, m.latestClosedDay ? `${m.latestClosedDay.business_date} Sales Account` : "Date Sales Account")}
         ${renderShiftWiseSalesReport(m.latestClosedDay, m.latestShiftWiseReport)}
       </section>`
     )
@@ -2619,6 +2634,7 @@ async function renderShiftClose(req, res, values = {}, error = "") {
       ${inlineError(error)}
       <label class="field span-2"><span>Active pump</span><select name="pump_id" onchange="window.location='/shift/close?pump_id='+this.value">${openPumps.map((p) => option(p.pump_id, `${p.business_date} - ${p.pump} - ${p.user_name}`, selectedPumpId)).join("")}</select></label>
       <label class="field"><span>Closing date</span><input name="closing_date" type="date" value="${esc(fieldValue(values, "closing_date", defaultClosingDate))}" required><small>Defaults to the next date after the business date.</small></label>
+      <label class="field"><span>Time in</span><input value="${esc(selectedPump?.time_in || "")}" readonly><small>From start shift.</small></label>
       <label class="field"><span>Time out</span><input name="time_out" type="time" value="${esc(fieldValue(values, "time_out", nowTimeIst()))}"></label>
       <div class="form-section"><strong>${esc(selectedPump?.pump || "Pump")} readings and prices</strong><small>Enter closing readings to preview litres, sales and balance.</small></div>
       <label class="field"><span>MS price</span><input value="${esc(rs(selectedPump?.ms_rate || 0))}" readonly></label>
@@ -3042,9 +3058,19 @@ app.get("/reports", requireLogin, async (req, res) => {
   const pumps = await all(
     "SELECT id, name FROM pumps WHERE status='Active' ORDER BY CASE WHEN name GLOB 'Pump [0-9]*' THEN CAST(SUBSTR(name, 6) AS INTEGER) ELSE 999999 END, name"
   );
+  const userFilterParams = [start, end, ...(pumpId ? [Number(pumpId)] : [])];
   const users = req.user.role === "pump_boy"
     ? []
-    : await all("SELECT id, name FROM users WHERE status='Active' AND role IN ('admin','manager','pump_boy') ORDER BY name");
+    : await all(
+      `SELECT DISTINCT u.id, u.name
+       FROM shift_entries se
+       JOIN users u ON u.id=se.user_id
+       JOIN nozzles n ON n.id=se.nozzle_id
+       JOIN pumps p ON p.id=n.pump_id
+       WHERE se.business_date BETWEEN ? AND ? ${pumpId ? "AND p.id=?" : ""}
+       ORDER BY u.name`,
+      userFilterParams
+    );
   const shiftDefs = await all("SELECT * FROM shift_defs WHERE status='Active' ORDER BY start_time");
   const shiftRows = await all(
     `SELECT se.business_date, d.ms_price, d.hsd_price, p.id pump_id, p.name pump, u.name user_name, sd.name shift_name, se.product,
