@@ -2196,8 +2196,9 @@ async function renderDayStart(req, res, values = {}, error = "") {
   for (const nozzle of nozzles) {
     const currentOpening = currentDay ? await dayOpeningMeter(currentDay.id, nozzle.id) : null;
     const previousOpening = await previousClosedMeter(nozzle.id, selectedDate);
-    nozzle.suggested_opening = currentOpening ?? previousOpening ?? 0;
+    nozzle.suggested_opening = currentOpening ?? previousOpening ?? "";
     nozzle.readonly_opening = lockedOpenDay || (!currentDay && previousOpening != null);
+    nozzle.manual_opening = !currentDay && previousOpening == null;
   }
   const currentRows = currentDay ? await dayOpeningRows(currentDay.id) : [];
   const recentDays = (await all("SELECT id, business_date, ms_price, hsd_price, status FROM days ORDER BY business_date DESC LIMIT 10")).map((d) => ({
@@ -2219,7 +2220,7 @@ async function renderDayStart(req, res, values = {}, error = "") {
           .map((n) => {
             const name = `meter_${n.id}_opening`;
             const suggested = n.suggested_opening;
-            return `<label class="field"><span>${esc(n.product)}</span><input name="${name}" type="number" step="0.001" value="${esc(fieldValue(values, name, suggested))}" ${n.readonly_opening ? "readonly" : ""} required>${n.readonly_opening ? '<small>Auto-filled from previous closed day. Edit after saving if correction is needed.</small>' : ""}</label>`;
+            return `<label class="field"><span>${esc(n.product)}</span><input name="${name}" type="number" step="0.001" value="${esc(fieldValue(values, name, suggested))}" ${n.readonly_opening ? "readonly" : ""} required>${n.readonly_opening ? '<small>Auto-filled from previous closed day. Edit after saving if correction is needed.</small>' : n.manual_opening ? '<small>No previous closing found. Enter opening manually.</small>' : ""}</label>`;
           })
           .join("");
         return `<div class="form-section"><strong>${esc(p.name)}</strong><small>Opening meter readings</small></div>${pumpMeters}`;
