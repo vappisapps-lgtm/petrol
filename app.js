@@ -1051,6 +1051,8 @@ function groupPumpEntries(entries) {
         hsd_opening: "",
         ms_closing: "",
         hsd_closing: "",
+        ms_rate: "",
+        hsd_rate: "",
         status: e.status,
       });
     }
@@ -1058,10 +1060,12 @@ function groupPumpEntries(entries) {
     if (e.product === "MS") {
       row.ms_opening = e.opening_meter;
       row.ms_closing = e.closing_meter ?? "";
+      row.ms_rate = e.rate;
     }
     if (e.product === "HSD") {
       row.hsd_opening = e.opening_meter;
       row.hsd_closing = e.closing_meter ?? "";
+      row.hsd_rate = e.rate;
     }
   }
   return Array.from(grouped.values());
@@ -1073,7 +1077,7 @@ async function activePumpGroups(req) {
   return groupPumpEntries(
     await all(
       `SELECT se.id, se.business_date, p.id pump_id, p.name pump, se.product, u.name user_name, sd.name shift_name,
-       se.opening_meter, se.closing_meter, se.status, se.opened_at, se.closed_at
+       se.opening_meter, se.closing_meter, se.rate, se.status, se.opened_at, se.closed_at
        FROM shift_entries se
        JOIN users u ON u.id=se.user_id
        JOIN shift_defs sd ON sd.id=se.shift_def_id
@@ -2509,6 +2513,13 @@ async function renderShiftClose(req, res, values = {}, error = "") {
   const selectedPump = openPumps.find((p) => Number(p.pump_id) === selectedPumpId);
   const loggedTotals = selectedPump ? await getPumpPaymentTotals(selectedPumpId, req) : { cash: 0, phone_pay: 0, credit: 0, miscellaneous: 0, beta: 0, total: 0 };
   const paymentRows = selectedPump ? await getPumpPaymentRows(selectedPumpId, req) : [];
+  const calcData = {
+    msOpening: Number(selectedPump?.ms_opening || 0),
+    hsdOpening: Number(selectedPump?.hsd_opening || 0),
+    msRate: Number(selectedPump?.ms_rate || 0),
+    hsdRate: Number(selectedPump?.hsd_rate || 0),
+    loggedTotal: Number(loggedTotals.total || 0),
+  };
   res.send(layout(req, "Close Shift", `${pageHead("Close Shift", "Operations > Close Shift")}
     <section class="stat-grid">
       <div class="stat"><span>Logged cash</span><strong>${rs(loggedTotals.cash)}</strong></div>
@@ -2521,20 +2532,68 @@ async function renderShiftClose(req, res, values = {}, error = "") {
     <section class="form-card"><form method="post" class="grid-form">
       ${inlineError(error)}
       <label class="field span-2"><span>Active pump</span><select name="pump_id" onchange="window.location='/shift/close?pump_id='+this.value">${openPumps.map((p) => option(p.pump_id, `${p.business_date} - ${p.pump} - ${p.user_name}`, selectedPumpId)).join("")}</select></label>
-      <div class="form-section"><strong>${esc(selectedPump?.pump || "Pump")} opening readings</strong><small>Captured when the shift started.</small></div>
-      <label class="field"><span>MS opening meter</span><input value="${esc(selectedPump?.ms_opening ?? "")}" readonly></label>
-      <label class="field"><span>HSD opening meter</span><input value="${esc(selectedPump?.hsd_opening ?? "")}" readonly></label>
       <label class="field"><span>Time out</span><input name="time_out" type="time" value="${esc(fieldValue(values, "time_out", nowTimeIst()))}"></label>
-      <div class="form-section"><strong>${esc(selectedPump?.pump || "Pump")} closing meters</strong><small>Close MS and HSD together for this pump.</small></div>
-      <label class="field"><span>MS closing meter</span><input name="closing_MS" type="number" step="0.001" value="${esc(fieldValue(values, "closing_MS", selectedPump?.ms_closing || ""))}" required></label>
-      <label class="field"><span>HSD closing meter</span><input name="closing_HSD" type="number" step="0.001" value="${esc(fieldValue(values, "closing_HSD", selectedPump?.hsd_closing || ""))}" required></label>
+      <div class="form-section"><strong>${esc(selectedPump?.pump || "Pump")} readings and prices</strong><small>Enter closing readings to preview litres, sales and balance.</small></div>
+      <label class="field"><span>MS price</span><input value="${esc(rs(selectedPump?.ms_rate || 0))}" readonly></label>
+      <label class="field"><span>HSD price</span><input value="${esc(rs(selectedPump?.hsd_rate || 0))}" readonly></label>
+      <label class="field"><span>MS opening meter</span><input value="${esc(selectedPump?.ms_opening ?? "")}" readonly></label>
+      <label class="field"><span>MS closing meter</span><input id="closingMS" name="closing_MS" type="number" step="0.001" value="${esc(fieldValue(values, "closing_MS", selectedPump?.ms_closing || ""))}" required></label>
+      <label class="field"><span>HSD opening meter</span><input value="${esc(selectedPump?.hsd_opening ?? "")}" readonly></label>
+      <label class="field"><span>HSD closing meter</span><input id="closingHSD" name="closing_HSD" type="number" step="0.001" value="${esc(fieldValue(values, "closing_HSD", selectedPump?.hsd_closing || ""))}" required></label>
       <label class="field"><span>MS testing qty</span><input name="testing_MS" type="number" step="0.001" value="${esc(fieldValue(values, "testing_MS", 0))}"></label>
       <label class="field"><span>HSD testing qty</span><input name="testing_HSD" type="number" step="0.001" value="${esc(fieldValue(values, "testing_HSD", 0))}"></label>
       <label class="field"><span>Expenses</span><input name="expenses" type="number" step="0.01" value="${esc(fieldValue(values, "expenses", 0))}"></label>
       <label class="field"><span>Expense category</span><select name="expense_category">${DEFAULT_EXPENSE_CATEGORIES.map((c) => option(c, c, fieldValue(values, "expense_category", "Miscellaneous"))).join("")}</select></label>
+      <div class="form-section"><strong>Live closing calculation</strong><small>Updates immediately from the closing readings and logged payments.</small></div>
+      <section class="stat-grid span-2" id="closeCalc" data-calc="${esc(JSON.stringify(calcData))}">
+        <div class="stat"><span>MS litres</span><strong data-value="msLitres">0.000 L</strong></div>
+        <div class="stat"><span>MS sales</span><strong data-value="msSales">Rs. 0.00</strong></div>
+        <div class="stat"><span>HSD litres</span><strong data-value="hsdLitres">0.000 L</strong></div>
+        <div class="stat"><span>HSD sales</span><strong data-value="hsdSales">Rs. 0.00</strong></div>
+        <div class="stat hero"><span>Total sales</span><strong data-value="totalSales">Rs. 0.00</strong></div>
+        <div class="stat"><span>Payment added</span><strong data-value="loggedPayment">${rs(loggedTotals.total)}</strong></div>
+        <div class="stat"><span>Balance to pay</span><strong data-value="balanceDue">Rs. 0.00</strong></div>
+        <div class="stat"><span>Shortage / Excess</span><strong data-value="shortageExcess">Rs. 0.00</strong></div>
+      </section>
       <label class="field span-2"><span>Remarks</span><textarea name="remarks">${esc(fieldValue(values, "remarks", ""))}</textarea></label>
       <div class="action-row"><button class="primary" ${openPumps.length ? "" : "disabled"}>Close Pump</button></div>
-    </form></section>
+    </form>
+    <script>
+      (function () {
+        const calc = document.getElementById("closeCalc");
+        if (!calc) return;
+        const data = JSON.parse(calc.dataset.calc || "{}");
+        const number = (name) => Number((document.querySelector('[name="' + name + '"]') || {}).value || 0);
+        const set = (key, value) => {
+          const el = calc.querySelector('[data-value="' + key + '"]');
+          if (el) el.textContent = value;
+        };
+        const rsFmt = (value) => "Rs. " + Number(value || 0).toFixed(2);
+        const ltrFmt = (value) => Number(value || 0).toFixed(3) + " L";
+        function updateCloseCalc() {
+          const msLitres = Math.max(0, (number("closing_MS") - Number(data.msOpening || 0)) - number("testing_MS"));
+          const hsdLitres = Math.max(0, (number("closing_HSD") - Number(data.hsdOpening || 0)) - number("testing_HSD"));
+          const msSales = msLitres * Number(data.msRate || 0);
+          const hsdSales = hsdLitres * Number(data.hsdRate || 0);
+          const totalSales = msSales + hsdSales;
+          const logged = Number(data.loggedTotal || 0);
+          const expenses = number("expenses");
+          set("msLitres", ltrFmt(msLitres));
+          set("msSales", rsFmt(msSales));
+          set("hsdLitres", ltrFmt(hsdLitres));
+          set("hsdSales", rsFmt(hsdSales));
+          set("totalSales", rsFmt(totalSales));
+          set("loggedPayment", rsFmt(logged));
+          set("balanceDue", rsFmt(totalSales - logged));
+          set("shortageExcess", rsFmt(logged + expenses - totalSales));
+        }
+        ["closing_MS", "closing_HSD", "testing_MS", "testing_HSD", "expenses"].forEach((name) => {
+          const input = document.querySelector('[name="' + name + '"]');
+          if (input) input.addEventListener("input", updateCloseCalc);
+        });
+        updateCloseCalc();
+      })();
+    </script></section>
     <section class="table-card"><div class="table-card-head"><div><h2>Logged Payments</h2><p>These payments will be used for closing tally.</p></div></div>${tableColumns(paymentRows, ["time", "pump", "salesperson", "payment_type", "amount", "customer", "note", "actions"])}</section>
     <section class="table-card">${tableColumns(openPumps, ["business_date", "pump", "user_name", "shift_name", "time_in", "ms_opening", "hsd_opening", "status"])}</section>`));
 }
