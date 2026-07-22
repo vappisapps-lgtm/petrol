@@ -2638,9 +2638,14 @@ async function renderShiftClose(req, res, values = {}, error = "") {
         <div class="stat"><span>HSD sales</span><strong data-value="hsdSales">Rs. 0.00</strong></div>
         <div class="stat hero"><span>Total sales</span><strong data-value="totalSales">Rs. 0.00</strong></div>
         <div class="stat"><span>Payment added</span><strong data-value="loggedPayment">${rs(loggedTotals.total)}</strong></div>
+        <div class="stat"><span>Paying now</span><strong data-value="closingPayment">Rs. 0.00</strong></div>
         <div class="stat"><span>Balance to pay</span><strong data-value="balanceDue">Rs. 0.00</strong></div>
         <div class="stat"><span>Shortage / Excess</span><strong data-value="shortageExcess">Rs. 0.00</strong></div>
       </section>
+      <div class="form-section"><strong>Payment at closing</strong><small>Use this when the salesperson pays part or all of the balance during close.</small></div>
+      <label class="field"><span>Amount paid now</span><input name="closing_payment_amount" type="number" step="0.01" value="${esc(fieldValue(values, "closing_payment_amount", ""))}"></label>
+      <label class="field"><span>Payment method</span><select name="closing_payment_type">${["Cash", "Phone Pay", "Miscellaneous", "Beta"].map((p) => option(p, p, fieldValue(values, "closing_payment_type", "Cash"))).join("")}</select></label>
+      <label class="field span-2"><span>Payment note</span><input name="closing_payment_note" value="${esc(fieldValue(values, "closing_payment_note", "Paid during shift closing"))}"></label>
       <div class="form-section"><strong>6AM price split</strong><small>${priceSplit.hasBoundaryReadings ? `Split point: ${esc(priceSplit.boundaryDate)} 06:00 from day closing readings.` : "Available after day closing readings are saved for this pump."}</small></div>
       <section class="stat-grid span-2" id="priceSplitCalc">
         <div class="stat"><span>MS before 6AM</span><strong data-value="msBefore6">0.000 L</strong><small data-value="msOldPrice">Old price</small></div>
@@ -2673,6 +2678,7 @@ async function renderShiftClose(req, res, values = {}, error = "") {
           const hsdSales = hsdLitres * Number(data.hsdRate || 0);
           const totalSales = msSales + hsdSales;
           const logged = Number(data.loggedTotal || 0);
+          const closingPayment = Math.max(0, number("closing_payment_amount"));
           const expenses = number("expenses");
           let msAfter6 = 0;
           let hsdAfter6 = 0;
@@ -2689,8 +2695,9 @@ async function renderShiftClose(req, res, values = {}, error = "") {
           set("hsdSales", rsFmt(hsdSales));
           set("totalSales", rsFmt(totalSales));
           set("loggedPayment", rsFmt(logged));
-          set("balanceDue", rsFmt(totalSales - logged));
-          set("shortageExcess", rsFmt(logged + expenses - totalSales));
+          set("closingPayment", rsFmt(closingPayment));
+          set("balanceDue", rsFmt(totalSales - logged - closingPayment));
+          set("shortageExcess", rsFmt(logged + closingPayment + expenses - totalSales));
           set("msBefore6", ltrFmt(msBefore6));
           set("msAfter6", ltrFmt(msAfter6));
           set("hsdBefore6", ltrFmt(hsdBefore6));
@@ -2701,7 +2708,7 @@ async function renderShiftClose(req, res, values = {}, error = "") {
           set("hsdOldPrice", "Old: " + rsFmt(data.hsdOldPrice));
           set("hsdNewPrice", "New: " + rsFmt(data.hsdNewPrice));
         }
-        ["closing_MS", "closing_HSD", "testing_MS", "testing_HSD", "expenses"].forEach((name) => {
+        ["closing_MS", "closing_HSD", "testing_MS", "testing_HSD", "expenses", "closing_payment_amount"].forEach((name) => {
           const input = document.querySelector('[name="' + name + '"]');
           if (input) input.addEventListener("input", updateCloseCalc);
         });
@@ -2759,6 +2766,34 @@ app.route("/shift/close")
       const sold = Math.max(0, litres(closing - Number(entry.opening_meter) - testingQty));
       const amount = money(sold * Number(entry.rate));
       calculated.push({ entry, closing, testingQty, sold, amount });
+    }
+    const closingPaymentAmount = money(req.body.closing_payment_amount);
+    const closingPaymentType = String(req.body.closing_payment_type || "Cash").trim();
+    if (req.body.closing_payment_amount && (!Number.isFinite(closingPaymentAmount) || closingPaymentAmount <= 0)) {
+      return await renderShiftClose(req, res, req.body, "Enter a valid closing payment amount, or leave it blank.");
+    }
+    if (closingPaymentAmount > 0) {
+      if (!["Cash", "Phone Pay", "Miscellaneous", "Beta"].includes(closingPaymentType)) {
+        return await renderShiftClose(req, res, req.body, "Select a valid closing payment method.");
+      }
+      const values = paymentSplit(closingPaymentType, closingPaymentAmount);
+      await run(
+        `INSERT INTO shift_payments(shift_entry_id, product, payment_type, amount, cash, upi, card, credit, customer_id, note, recorded_at)
+         VALUES(?,?,?,?,?,?,?,?,?,?,?)`,
+        [
+          entries[0].id,
+          null,
+          closingPaymentType,
+          closingPaymentAmount,
+          values.cash,
+          values.upi,
+          values.card,
+          values.credit,
+          null,
+          req.body.closing_payment_note || "Paid during shift closing",
+          closedAt,
+        ]
+      );
     }
     const currentPayments = { cash: 0, upi: 0, credit: 0, beta: 0, miscellaneous: 0 };
     for (const item of calculated) {
