@@ -799,7 +799,7 @@ async function getShiftPaymentsTotal(entryId) {
      COALESCE(SUM(CASE WHEN payment_type='Credit' THEN amount ELSE credit END),0) credit,
      COALESCE(SUM(CASE WHEN payment_type='Miscellaneous' THEN amount ELSE 0 END),0) miscellaneous,
      COALESCE(SUM(CASE WHEN payment_type='Beta' THEN amount ELSE 0 END),0) beta,
-     COALESCE(SUM(CASE WHEN amount > 0 THEN amount ELSE cash+upi+card+credit END),0) total
+     COALESCE(SUM(CASE WHEN amount != 0 THEN amount ELSE cash+upi+card+credit END),0) total
      FROM shift_payments WHERE shift_entry_id=?`,
     [entryId]
   );
@@ -2317,7 +2317,7 @@ app.post("/shift/pump/:pumpId/payment", requireLogin, async (req, res) => {
   const amount = money(req.body.amount);
   const entry = entries[0];
   if (!PAYMENT_TYPES.includes(paymentType)) return await renderPumpPayments(req, res, pump, entries, req.body, "Select a valid payment type.");
-  if (!amount || amount <= 0) return await renderPumpPayments(req, res, pump, entries, req.body, "Enter payment amount.");
+  if (!Number.isFinite(amount) || amount === 0) return await renderPumpPayments(req, res, pump, entries, req.body, "Enter a non-zero payment amount.");
   if (paymentType === "Credit" && !req.body.customer_id) return await renderPumpPayments(req, res, pump, entries, req.body, "Select credit customer for Credit payment.");
   const values = paymentSplit(paymentType, amount);
   const businessDate = entry.business_date || todayIso();
@@ -2430,7 +2430,7 @@ app.post("/shift/payment/:paymentId/edit", requireLogin, async (req, res) => {
   const amount = money(req.body.amount);
   const customerId = req.body.customer_id ? Number(req.body.customer_id) : null;
   if (!PAYMENT_TYPES.includes(paymentType)) return await renderPaymentEdit(req, res, payment, req.body, "Select a valid payment type.");
-  if (!amount || amount <= 0) return await renderPaymentEdit(req, res, payment, req.body, "Enter payment amount.");
+  if (!Number.isFinite(amount) || amount === 0) return await renderPaymentEdit(req, res, payment, req.body, "Enter a non-zero payment amount.");
   if (paymentType === "Credit" && !customerId) return await renderPaymentEdit(req, res, payment, req.body, "Select credit customer for Credit payment.");
   const values = paymentSplit(paymentType, amount);
   const recordedAt = req.body.recorded_at ? `${payment.business_date} ${String(req.body.recorded_at).slice(0, 5)}:00` : payment.recorded_at;
