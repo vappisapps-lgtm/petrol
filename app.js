@@ -2099,6 +2099,8 @@ app.route("/day/start")
          testing_ms_qty=?, testing_hsd_qty=?, notes=? WHERE id=?`,
         [Number(b.ms_price), Number(b.hsd_price), openingMs, openingHsd, testingDone, totalTestingMs, totalTestingHsd, b.notes || "", dayId]
       );
+      await run("UPDATE shift_entries SET rate=? WHERE day_id=? AND product='MS' AND status='Open'", [Number(b.ms_price), dayId]);
+      await run("UPDATE shift_entries SET rate=? WHERE day_id=? AND product='HSD' AND status='Open'", [Number(b.hsd_price), dayId]);
     } else {
       const result = await run(
         `INSERT INTO days(business_date, ms_price, hsd_price, opening_ms, opening_hsd, testing_done, testing_ms_qty, testing_hsd_qty, opening_cash, notes)
@@ -2532,6 +2534,7 @@ async function renderShiftClose(req, res, values = {}, error = "") {
     <section class="form-card"><form method="post" class="grid-form">
       ${inlineError(error)}
       <label class="field span-2"><span>Active pump</span><select name="pump_id" onchange="window.location='/shift/close?pump_id='+this.value">${openPumps.map((p) => option(p.pump_id, `${p.business_date} - ${p.pump} - ${p.user_name}`, selectedPumpId)).join("")}</select></label>
+      <label class="field"><span>Closing date</span><input name="closing_date" type="date" value="${esc(fieldValue(values, "closing_date", todayIso()))}" required></label>
       <label class="field"><span>Time out</span><input name="time_out" type="time" value="${esc(fieldValue(values, "time_out", nowTimeIst()))}"></label>
       <div class="form-section"><strong>${esc(selectedPump?.pump || "Pump")} readings and prices</strong><small>Enter closing readings to preview litres, sales and balance.</small></div>
       <label class="field"><span>MS price</span><input value="${esc(rs(selectedPump?.ms_rate || 0))}" readonly></label>
@@ -2621,7 +2624,13 @@ app.route("/shift/close")
       const opened = normalizeTimestamp(entry.opened_at);
       return !earliest || opened < earliest ? opened : earliest;
     }, "");
-    const closedAt = closingTimestampForBusinessTime(entries[0].business_date, req.body.time_out, openedAt);
+    const closingDate = String(req.body.closing_date || "").trim();
+    const timeOut = String(req.body.time_out || nowTimeIst()).slice(0, 5);
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(closingDate)) return await renderShiftClose(req, res, req.body, "Select closing date.");
+    const closedAt = `${closingDate} ${timeOut}:00`;
+    if (normalizeTimestamp(closedAt) <= normalizeTimestamp(openedAt)) {
+      return await renderShiftClose(req, res, req.body, "Closing date and time must be after shift start.");
+    }
     const calculated = [];
     for (const entry of entries) {
       const closing = Number(req.body[`closing_${entry.product}`]);
