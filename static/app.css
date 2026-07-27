@@ -199,6 +199,33 @@ a { color: inherit; text-decoration: none; }
 .dashboard-slot-card span { font-weight: 800; }
 .dashboard-slot-card small { color: var(--muted); font-weight: 800; }
 .dashboard-slot-card.is-empty { color: var(--muted); border-color: #f1a17c; }
+.dashboard-account-table { margin-bottom: 18px; }
+.dashboard-account-table .account-title {
+  justify-content: center;
+  padding: 10px 14px;
+  border-left: 2px solid var(--green);
+}
+.dashboard-account-table .account-title h2 { font-size: 16px; }
+.dashboard-account-table table { white-space: normal; }
+.dashboard-account-table th,
+.dashboard-account-table td {
+  border: 1px solid #56615c;
+  padding: 8px 9px;
+  text-align: center;
+  vertical-align: middle;
+}
+.dashboard-account-table th {
+  color: #101815;
+  font-size: 10px;
+  letter-spacing: 0;
+  line-height: 1.15;
+  background: #fbfcfb;
+}
+.dashboard-account-table td { font-size: 12px; font-weight: 650; }
+.dashboard-account-table tbody tr:last-child td {
+  font-weight: 900;
+  background: #fbfcfb;
+}
 .text-link { color: var(--green); font-weight: 900; text-decoration: underline; text-underline-offset: 3px; }
 .panel { padding: 20px; }
 .panel-title { display: flex; align-items: center; justify-content: space-between; margin-bottom: 14px; gap: 12px; }

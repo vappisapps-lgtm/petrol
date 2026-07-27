@@ -1694,6 +1694,7 @@ app.get("/", requireLogin, async (req, res) => {
   const dayRows = metrics.latestDayReport || await dayReportRows(latestClosedDay.id);
   const totals = dayReportTotals(dayRows);
   const shiftRows = await dashboardShiftPersonRows(latestClosedDay.id);
+  const accountRows = await dashboardAccountRows(latestClosedDay.id);
   const shiftTotals = shiftRows.reduce(
     (acc, row) => {
       acc.ms_litres = litres(acc.ms_litres + Number(row.ms_litres || 0));
@@ -1732,6 +1733,7 @@ app.get("/", requireLogin, async (req, res) => {
       </section>
       ${renderDashboardPumpOwnerCards(dayRows)}
       ${renderDashboardTimeSlotCards(latestClosedDay, shiftRows, dayRows)}
+      ${renderDashboardAccountTable(latestClosedDay, accountRows)}
       <section class="dashboard-window-grid">
         <div class="panel"><div class="panel-title"><h2>Entry Sales Summary</h2><span class="badge">${esc(latestClosedDay.business_date)}</span></div>
           <div class="mini-grid">
@@ -2296,6 +2298,94 @@ function renderDashboardTimeSlotCards(day, rows = [], dayRows = []) {
     return `<div class="dashboard-slot-column"><h3>${esc(pump.pump)}</h3>${slots}</div>`;
   }).join("");
   return `<section class="dashboard-slot-shell">${cards || '<div class="dashboard-slot-column"><h3>Pump sales</h3><article class="dashboard-slot-card is-empty"><strong>No entry sales</strong><span>MS 0 L / HSD 0 L</span><small>₹ 0.00</small></article></div>'}</section>`;
+}
+
+function dateSlash(dateIso) {
+  const text = String(dateIso || "");
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(text)) return text;
+  return `${text.slice(8, 10)}/${text.slice(5, 7)}/${text.slice(0, 4)}`;
+}
+
+async function dashboardAccountRows(dayId) {
+  const rows = await all(
+    `SELECT se.business_date, se.product, p.name pump, u.name salesperson, u.mobile login_id,
+     se.opening_meter, se.closing_meter, se.testing_qty, se.litres_sold, se.rate, se.sales_amount,
+     se.cash, se.upi, se.card, se.credit, se.beta, se.miscellaneous, se.shortage_excess
+     FROM shift_entries se
+     JOIN users u ON u.id=se.user_id
+     JOIN nozzles n ON n.id=se.nozzle_id
+     JOIN pumps p ON p.id=n.pump_id
+     WHERE se.day_id=? AND se.status='Closed'
+     ORDER BY ${pumpOrderSql("p")}, se.opened_at, se.product`,
+    [dayId]
+  );
+  return rows.map((row, index) => {
+    const opening = Number(row.opening_meter || 0);
+    const closing = Number(row.closing_meter || 0);
+    const netVolume = litres(Math.max(0, closing - opening));
+    const testVolume = litres(row.testing_qty || 0);
+    const grossSale = litres(row.litres_sold || Math.max(0, netVolume - testVolume));
+    const balanceCash = Number(row.shortage_excess || 0) < 0 ? money(Math.abs(row.shortage_excess)) : 0;
+    return {
+      no: index + 1,
+      details: `${row.product}-${row.pump}`,
+      name: row.salesperson,
+      pump_reading_duty_down: closing,
+      pump_reading_duty_up: opening,
+      pump_net_volume: netVolume,
+      test_volume: testVolume,
+      gross_sale_litres: grossSale,
+      rate_per_litre: money(row.rate || 0),
+      amount: money(row.sales_amount || 0),
+      cash_deposits: money(row.cash || 0),
+      phone_pay: money(row.upi || 0),
+      swiping: money(row.card || 0),
+      ppp: money(row.beta || 0),
+      others: money(row.miscellaneous || 0),
+      balance_cash: balanceCash,
+    };
+  });
+}
+
+function renderDashboardAccountTable(day, rows = []) {
+  const totals = rows.reduce(
+    (acc, row) => {
+      acc.pump_net_volume = litres(acc.pump_net_volume + Number(row.pump_net_volume || 0));
+      acc.test_volume = litres(acc.test_volume + Number(row.test_volume || 0));
+      acc.gross_sale_litres = litres(acc.gross_sale_litres + Number(row.gross_sale_litres || 0));
+      acc.amount = money(acc.amount + Number(row.amount || 0));
+      acc.cash_deposits = money(acc.cash_deposits + Number(row.cash_deposits || 0));
+      acc.phone_pay = money(acc.phone_pay + Number(row.phone_pay || 0));
+      acc.swiping = money(acc.swiping + Number(row.swiping || 0));
+      acc.ppp = money(acc.ppp + Number(row.ppp || 0));
+      acc.others = money(acc.others + Number(row.others || 0));
+      acc.balance_cash = money(acc.balance_cash + Number(row.balance_cash || 0));
+      return acc;
+    },
+    { pump_net_volume: 0, test_volume: 0, gross_sale_litres: 0, amount: 0, cash_deposits: 0, phone_pay: 0, swiping: 0, ppp: 0, others: 0, balance_cash: 0 }
+  );
+  const tableRows = rows.concat(rows.length ? [{
+    no: "",
+    details: "Total",
+    name: "",
+    pump_reading_duty_down: "",
+    pump_reading_duty_up: "",
+    pump_net_volume: totals.pump_net_volume,
+    test_volume: totals.test_volume,
+    gross_sale_litres: totals.gross_sale_litres,
+    rate_per_litre: "",
+    amount: totals.amount,
+    cash_deposits: totals.cash_deposits,
+    phone_pay: totals.phone_pay,
+    swiping: totals.swiping,
+    ppp: totals.ppp,
+    others: totals.others,
+    balance_cash: totals.balance_cash,
+  }] : []);
+  return `<section class="table-card dashboard-account-table">
+    <div class="table-card-head account-title"><h2>Dt: ${esc(dateSlash(day.business_date))} Account</h2></div>
+    ${tableColumns(tableRows, ["no", "details", "name", "pump_reading_duty_down", "pump_reading_duty_up", "pump_net_volume", "test_volume", "gross_sale_litres", "rate_per_litre", "amount", "cash_deposits", "phone_pay", "swiping", "ppp", "others", "balance_cash"])}
+  </section>`;
 }
 
 function renderDashboardShiftPumpCards(day, rows = [], dayRows = []) {
