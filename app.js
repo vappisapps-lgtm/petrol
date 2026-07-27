@@ -1707,7 +1707,7 @@ app.get("/", requireLogin, async (req, res) => {
         </div>
         <div class="panel"><div class="panel-title"><h2>Payment Split</h2></div>${paymentTotals.map((r) => `<div class="ledger-line"><span>${esc(r.payment_type || "Unsorted")}</span><strong>${esc(rs(r.amount))}</strong></div>`).join("") || '<p class="muted">No shift payments logged for this sales date.</p>'}</div>
       </section>
-      ${renderDashboardShiftPumpCards(latestClosedDay, shiftRows)}
+      ${renderDashboardShiftPumpCards(latestClosedDay, shiftRows, dayRows)}
       ${renderDashboardCreditCard(latestClosedDay, creditRows)}`
     )
   );
@@ -2207,18 +2207,28 @@ function renderDashboardPumpOwnerCards(dayRows = []) {
   return `<section class="dashboard-pump-grid">${cards || '<section class="table-card"><div class="table-card-head"><div><h2>Pump Day Sales</h2><p>No closed pump readings for this date.</p></div></div></section>'}</section>`;
 }
 
-function renderDashboardShiftPumpCards(day, rows = []) {
+function renderDashboardShiftPumpCards(day, rows = [], dayRows = []) {
   const grouped = new Map();
   for (const row of rows) {
     if (!grouped.has(row.pump_id)) grouped.set(row.pump_id, []);
     grouped.get(row.pump_id).push(row);
   }
-  const cards = Array.from(grouped.entries()).map(([_pumpId, pumpRows]) => `
-    <section class="table-card dashboard-pump-card">
-      <div class="table-card-head"><div><h2>${esc(pumpRows[0]?.pump || "Pump")}</h2><p>Closed shift entries for ${esc(day.business_date)}.</p></div></div>
-      <div class="table-wrap"><table>
-        <thead><tr><th>Person</th><th>Login ID</th><th>Time</th><th>MS litres</th><th>HSD litres</th><th>Sales</th></tr></thead>
-        <tbody>${pumpRows.map((row) => `
+  const pumpList = [];
+  const seenPumps = new Set();
+  for (const row of dayRows) {
+    if (seenPumps.has(Number(row.pump_id))) continue;
+    seenPumps.add(Number(row.pump_id));
+    pumpList.push({ pump_id: Number(row.pump_id), pump: row.pump });
+  }
+  for (const row of rows) {
+    if (seenPumps.has(Number(row.pump_id))) continue;
+    seenPumps.add(Number(row.pump_id));
+    pumpList.push({ pump_id: Number(row.pump_id), pump: row.pump });
+  }
+  const cards = pumpList.map((pump) => {
+    const pumpRows = grouped.get(pump.pump_id) || [];
+    const body = pumpRows.length
+      ? pumpRows.map((row) => `
           <tr>
             <td><a class="text-link" href="/reports?start=${esc(day.business_date)}&end=${esc(day.business_date)}&pump_id=${esc(row.pump_id)}&user_id=${esc(row.user_id)}">${esc(row.salesperson)}</a></td>
             <td>${esc(row.login_id || "")}</td>
@@ -2226,9 +2236,17 @@ function renderDashboardShiftPumpCards(day, rows = []) {
             <td>${esc(litres(row.ms_litres).toFixed(3))}</td>
             <td>${esc(litres(row.hsd_litres).toFixed(3))}</td>
             <td>${esc(rs(row.sales))}</td>
-          </tr>`).join("")}</tbody>
+          </tr>`).join("")
+      : '<tr><td colspan="6">No closed shift entries for this pump.</td></tr>';
+    return `
+    <section class="table-card dashboard-pump-card">
+      <div class="table-card-head"><div><h2>${esc(pump.pump || "Pump")}</h2><p>Closed shift entries for ${esc(day.business_date)}.</p></div></div>
+      <div class="table-wrap"><table>
+        <thead><tr><th>Person</th><th>Login ID</th><th>Time</th><th>MS litres</th><th>HSD litres</th><th>Sales</th></tr></thead>
+        <tbody>${body}</tbody>
       </table></div>
-    </section>`).join("");
+    </section>`;
+  }).join("");
   return `<section class="dashboard-pump-grid">${cards || '<section class="table-card"><div class="table-card-head"><div><h2>Salesperson Pump Sales</h2><p>No closed shift entries for this sales date.</p></div></div></section>'}</section>`;
 }
 
