@@ -2219,7 +2219,7 @@ async function dashboardShiftPersonRows(dayId) {
 async function dashboardCreditRows(day) {
   if (!day) return [];
   return await all(
-    `SELECT c.name customer, COALESCE(SUM(cl.amount),0) amount
+    `SELECT c.id customer_id, c.name customer, COALESCE(SUM(cl.amount),0) amount
      FROM credit_ledger cl
      JOIN customers c ON c.id=cl.customer_id
      WHERE cl.business_date=? AND cl.entry_type='credit'
@@ -2441,7 +2441,7 @@ function renderDashboardShiftPumpCards(day, rows = [], dayRows = []) {
             <td>${esc(row.time_in)}-${esc(row.time_out)}</td>
             <td>${esc(fmtNumber(litres(row.ms_litres), 2))}</td>
             <td>${esc(fmtNumber(litres(row.hsd_litres), 2))}</td>
-            <td>${esc(rs(row.sales))}</td>
+            <td><a class="text-link" href="/reports?start=${esc(day.business_date)}&end=${esc(day.business_date)}&pump_id=${esc(row.pump_id)}&user_id=${esc(row.user_id)}">${esc(rs(row.sales))}</a></td>
           </tr>`).join("")
       : '<tr><td colspan="6">No closed shift entries for this pump.</td></tr>';
     return `
@@ -2458,7 +2458,7 @@ function renderDashboardShiftPumpCards(day, rows = [], dayRows = []) {
 
 function renderDashboardCreditCard(day, rows = []) {
   return `<section class="panel dashboard-credit"><div class="panel-title"><div><h2>Credit / Dues</h2><p class="muted">Credit report data for ${esc(day.business_date)}.</p></div></div>
-    ${rows.map((row) => `<div class="ledger-line"><span>${esc(row.customer)}</span><strong>${esc(rs(row.amount))}</strong></div>`).join("") || '<p class="muted">No credit dues for this sales date.</p>'}
+    ${rows.map((row) => `<div class="ledger-line"><a class="text-link" href="/customer/${esc(row.customer_id)}">${esc(row.customer)}</a><strong>${esc(rs(row.amount))}</strong></div>`).join("") || '<p class="muted">No credit dues for this sales date.</p>'}
   </section>`;
 }
 
@@ -3375,6 +3375,47 @@ app.route("/credit/payment")
     flash(req, "success", "Credit payment recorded.");
     res.redirect("/credit/payment");
   });
+
+app.get("/customer/:id", requireLogin, async (req, res) => {
+  const customer = await one("SELECT * FROM customers WHERE id=?", [Number(req.params.id)]);
+  if (!customer) {
+    flash(req, "error", "Customer was not found.");
+    return res.redirect("/");
+  }
+  const ledger = await all(
+    `SELECT business_date, entry_type, product, amount, payment_mode, pump_nozzle, team_member, notes, created_at
+     FROM credit_ledger
+     WHERE customer_id=?
+     ORDER BY business_date DESC, id DESC`,
+    [customer.id]
+  );
+  const totals = await one(
+    `SELECT
+     COALESCE(SUM(CASE WHEN entry_type='credit' THEN amount ELSE 0 END),0) credit_total,
+     COALESCE(SUM(CASE WHEN entry_type='payment' THEN amount ELSE 0 END),0) payment_total
+     FROM credit_ledger
+     WHERE customer_id=?`,
+    [customer.id]
+  );
+  const netCredit = money(Number(totals.credit_total || 0) - Number(totals.payment_total || 0));
+  res.send(layout(req, "Customer Credit", `${pageHead(customer.name, "Credit > Customer", '<a class="secondary link-button" href="/">Dashboard</a>')}
+    <section class="stat-grid">
+      <div class="stat hero"><span>Current balance</span><strong>${esc(rs(customer.balance))}</strong><small>${esc(customer.status || "")}</small></div>
+      <div class="stat"><span>Total credit</span><strong>${esc(rs(totals.credit_total || 0))}</strong></div>
+      <div class="stat"><span>Total payments</span><strong>${esc(rs(totals.payment_total || 0))}</strong></div>
+      <div class="stat"><span>Ledger net</span><strong>${esc(rs(netCredit))}</strong></div>
+    </section>
+    <section class="panel">
+      <div class="panel-title"><h2>Customer Details</h2></div>
+      <div class="mini-grid">
+        <article><strong>Mobile</strong><span>${esc(customer.mobile || "-")}</span></article>
+        <article><strong>Vehicle</strong><span>${esc(customer.vehicle_number || "-")}</span></article>
+        <article><strong>Company</strong><span>${esc(customer.company_name || "-")}</span></article>
+        <article><strong>Credit limit</strong><span>${esc(rs(customer.credit_limit || 0))}</span></article>
+      </div>
+    </section>
+    <section class="table-card"><div class="table-card-head"><div><h2>Credit Ledger</h2><p>Overall credit and payment history for this customer.</p></div></div>${tableColumns(ledger, ["business_date", "entry_type", "product", "amount", "payment_mode", "pump_nozzle", "team_member", "notes", "created_at"])}</section>`));
+});
 
 app.route("/day/close")
   .get(requireLogin, requireRoles("admin", "manager"), async (req, res) => {
