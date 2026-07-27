@@ -1731,6 +1731,7 @@ app.get("/", requireLogin, async (req, res) => {
         <div class="stat"><span>Credit</span><strong>${esc(rs(creditTotal))}</strong><small>${esc(latestClosedDay.business_date)} dues</small></div>
       </section>
       ${renderDashboardPumpOwnerCards(dayRows)}
+      ${renderDashboardTimeSlotCards(latestClosedDay, shiftRows, dayRows)}
       <section class="dashboard-window-grid">
         <div class="panel"><div class="panel-title"><h2>Entry Sales Summary</h2><span class="badge">${esc(latestClosedDay.business_date)}</span></div>
           <div class="mini-grid">
@@ -2242,12 +2243,7 @@ function renderDashboardPumpOwnerCards(dayRows = []) {
   return `<section class="dashboard-pump-grid">${cards || '<section class="table-card"><div class="table-card-head"><div><h2>Pump Day Sales</h2><p>No closed pump readings for this date.</p></div></div></section>'}</section>`;
 }
 
-function renderDashboardShiftPumpCards(day, rows = [], dayRows = []) {
-  const grouped = new Map();
-  for (const row of rows) {
-    if (!grouped.has(row.pump_id)) grouped.set(row.pump_id, []);
-    grouped.get(row.pump_id).push(row);
-  }
+function dashboardPumpList(rows = [], dayRows = []) {
   const pumpList = [];
   const seenPumps = new Set();
   for (const row of dayRows) {
@@ -2260,6 +2256,55 @@ function renderDashboardShiftPumpCards(day, rows = [], dayRows = []) {
     seenPumps.add(Number(row.pump_id));
     pumpList.push({ pump_id: Number(row.pump_id), pump: row.pump });
   }
+  return pumpList;
+}
+
+function ordinalDayFromTimestamp(value, fallbackDate) {
+  const date = dateFromTimestamp(value) || fallbackDate || "";
+  const day = Number(String(date).slice(8, 10));
+  if (!day) return "";
+  const suffix = day % 10 === 1 && day !== 11 ? "st" : day % 10 === 2 && day !== 12 ? "nd" : day % 10 === 3 && day !== 13 ? "rd" : "th";
+  return `${day}${suffix}`;
+}
+
+function compactTime(value) {
+  const time = String(value || "").slice(0, 5);
+  if (!time) return "";
+  const [hour, minute] = time.split(":").map(Number);
+  if (minute) return `${hour}:${String(minute).padStart(2, "0")}`;
+  return String(hour);
+}
+
+function renderDashboardTimeSlotCards(day, rows = [], dayRows = []) {
+  const grouped = new Map();
+  for (const row of rows) {
+    if (!grouped.has(row.pump_id)) grouped.set(row.pump_id, []);
+    grouped.get(row.pump_id).push(row);
+  }
+  const cards = dashboardPumpList(rows, dayRows).map((pump) => {
+    const pumpRows = grouped.get(pump.pump_id) || [];
+    const slots = pumpRows.length
+      ? pumpRows.map((row) => {
+        const label = `${ordinalDayFromTimestamp(row.opened_at, day.business_date)} ${compactTime(row.time_in)} to ${compactTime(row.time_out)} Sales`;
+        return `<article class="dashboard-slot-card">
+          <strong>${esc(label)}</strong>
+          <span>MS ${esc(ltr(row.ms_litres))} / HSD ${esc(ltr(row.hsd_litres))}</span>
+          <small>${esc(rs(row.sales))}</small>
+        </article>`;
+      }).join("")
+      : '<article class="dashboard-slot-card is-empty"><strong>No entry sales</strong><span>MS 0 L / HSD 0 L</span><small>₹ 0.00</small></article>';
+    return `<div class="dashboard-slot-column"><h3>${esc(pump.pump)}</h3>${slots}</div>`;
+  }).join("");
+  return `<section class="dashboard-slot-shell">${cards || '<div class="dashboard-slot-column"><h3>Pump sales</h3><article class="dashboard-slot-card is-empty"><strong>No entry sales</strong><span>MS 0 L / HSD 0 L</span><small>₹ 0.00</small></article></div>'}</section>`;
+}
+
+function renderDashboardShiftPumpCards(day, rows = [], dayRows = []) {
+  const grouped = new Map();
+  for (const row of rows) {
+    if (!grouped.has(row.pump_id)) grouped.set(row.pump_id, []);
+    grouped.get(row.pump_id).push(row);
+  }
+  const pumpList = dashboardPumpList(rows, dayRows);
   const cards = pumpList.map((pump) => {
     const pumpRows = grouped.get(pump.pump_id) || [];
     const body = pumpRows.length
