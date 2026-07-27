@@ -1695,24 +1695,6 @@ app.get("/", requireLogin, async (req, res) => {
   const totals = dayReportTotals(dayRows);
   const shiftRows = await dashboardShiftPersonRows(latestClosedDay.id);
   const splitAccountRows = await dashboardSixAmAccountRows(latestClosedDay);
-  const shiftTotals = shiftRows.reduce(
-    (acc, row) => {
-      acc.ms_litres = litres(acc.ms_litres + Number(row.ms_litres || 0));
-      acc.hsd_litres = litres(acc.hsd_litres + Number(row.hsd_litres || 0));
-      acc.sales = money(acc.sales + Number(row.sales || 0));
-      return acc;
-    },
-    { ms_litres: 0, hsd_litres: 0, sales: 0 }
-  );
-  const paymentTotals = await all(
-    `SELECT sp.payment_type, COALESCE(SUM(sp.amount),0) amount
-     FROM shift_payments sp
-     JOIN shift_entries se ON se.id=sp.shift_entry_id
-     WHERE se.day_id=?
-     GROUP BY sp.payment_type
-     ORDER BY sp.payment_type`,
-    [latestClosedDay.id]
-  );
   const creditRows = await dashboardCreditRows(latestClosedDay);
   const creditTotal = money(creditRows.reduce((sum, row) => sum + Number(row.amount || 0), 0));
   const activeContext = metrics.day
@@ -1733,17 +1715,6 @@ app.get("/", requireLogin, async (req, res) => {
       </section>
       ${renderDashboardPumpOwnerCards(dayRows)}
       ${renderDashboardSixAmAccountTables(latestClosedDay, splitAccountRows)}
-      <section class="dashboard-window-grid">
-        <div class="panel"><div class="panel-title"><h2>Entry Sales Summary</h2><span class="badge">${esc(latestClosedDay.business_date)}</span></div>
-          <div class="mini-grid">
-            <article><strong>MS litres</strong><span>${esc(ltr(shiftTotals.ms_litres))}</span></article>
-            <article><strong>HSD litres</strong><span>${esc(ltr(shiftTotals.hsd_litres))}</span></article>
-            <article><strong>Shift sales</strong><span>${esc(rs(shiftTotals.sales))}</span></article>
-            <article><strong>Entries</strong><span>${esc(shiftRows.length)}</span></article>
-          </div>
-        </div>
-        <div class="panel"><div class="panel-title"><h2>Payment Split</h2></div>${paymentTotals.map((r) => `<div class="ledger-line"><span>${esc(r.payment_type || "Unsorted")}</span><strong>${esc(rs(r.amount))}</strong></div>`).join("") || '<p class="muted">No shift payments logged for this sales date.</p>'}</div>
-      </section>
       ${renderDashboardShiftPumpCards(latestClosedDay, shiftRows, dayRows)}
       ${renderDashboardCreditCard(latestClosedDay, creditRows)}`
     )
@@ -2525,7 +2496,7 @@ function renderDashboardShiftPumpCards(day, rows = [], dayRows = []) {
           <tr>
             <td><a class="text-link" href="/reports?start=${esc(day.business_date)}&end=${esc(day.business_date)}&pump_id=${esc(row.pump_id)}&user_id=${esc(row.user_id)}">${esc(row.salesperson)}</a></td>
             <td>${esc(row.login_id || "")}</td>
-            <td>${esc(row.time_in)}-${esc(row.time_out)}</td>
+            <td>${esc(row.pump)}</td>
             <td>${esc(fmtNumber(litres(row.ms_litres), 2))}</td>
             <td>${esc(fmtNumber(litres(row.hsd_litres), 2))}</td>
             <td><a class="text-link" href="/reports?start=${esc(day.business_date)}&end=${esc(day.business_date)}&pump_id=${esc(row.pump_id)}&user_id=${esc(row.user_id)}">${esc(rs(row.sales))}</a></td>
@@ -2533,9 +2504,9 @@ function renderDashboardShiftPumpCards(day, rows = [], dayRows = []) {
       : '<tr><td colspan="6">No closed shift entries for this pump.</td></tr>';
     return `
     <section class="table-card dashboard-pump-card">
-      <div class="table-card-head"><div><h2>${esc(pump.pump || "Pump")}</h2><p>Closed shift entries for ${esc(day.business_date)}.</p></div></div>
+      <div class="table-card-head"><div><h2>${esc(pump.pump || "Pump")}</h2><p>Salesperson sales for ${esc(day.business_date)}.</p></div></div>
       <div class="table-wrap"><table>
-        <thead><tr><th>Person</th><th>Login ID</th><th>Time</th><th>MS litres</th><th>HSD litres</th><th>Sales</th></tr></thead>
+        <thead><tr><th>Person</th><th>Login ID</th><th>Pump</th><th>MS litres</th><th>HSD litres</th><th>Sales</th></tr></thead>
         <tbody>${body}</tbody>
       </table></div>
     </section>`;

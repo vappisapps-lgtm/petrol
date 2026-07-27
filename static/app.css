@@ -163,6 +163,12 @@ a { color: inherit; text-decoration: none; }
 .dashboard-grid > .table-card { grid-column: 1 / -1; }
 .dashboard-pump-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; margin-bottom: 18px; }
 .dashboard-pump-card .table-card-head { min-height: 82px; }
+.dashboard-pump-card td:first-child .text-link,
+.dashboard-credit .text-link {
+  display: inline-flex;
+  align-items: center;
+  min-height: 28px;
+}
 .dashboard-window-grid { display: grid; grid-template-columns: 2fr 1fr; gap: 16px; align-items: stretch; margin-bottom: 18px; }
 .dashboard-credit { margin-bottom: 18px; }
 .dashboard-slot-panel { margin-bottom: 18px; }
