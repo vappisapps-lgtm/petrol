@@ -657,12 +657,25 @@ function esc(value) {
     .replaceAll("'", "&#39;");
 }
 
+function fmtNumber(value, maxDigits = 2) {
+  if (value === "" || value == null) return "";
+  const number = Number(value);
+  if (!Number.isFinite(number)) return String(value);
+  return number.toLocaleString("en-IN", {
+    minimumFractionDigits: 0,
+    maximumFractionDigits: maxDigits,
+  });
+}
+
 function rs(value) {
-  return `Rs. ${money(value).toFixed(2)}`;
+  return `₹ ${money(value).toLocaleString("en-IN", {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2,
+  })}`;
 }
 
 function ltr(value) {
-  return `${litres(value).toFixed(3)} L`;
+  return `${fmtNumber(litres(value), 2)} L`;
 }
 
 function option(value, label, selected) {
@@ -1419,7 +1432,7 @@ function table(rows) {
   if (!rows.length) return `<div class="table-wrap"><table><thead><tr><th>Records</th></tr></thead><tbody><tr><td>No records yet.</td></tr></tbody></table></div>`;
   const keys = Object.keys(rows[0]);
   return `<div class="table-wrap"><table><thead><tr>${keys.map((k) => `<th>${esc(k.replaceAll("_", " "))}</th>`).join("")}</tr></thead><tbody>
-    ${rows.map((r) => `<tr>${keys.map((k) => `<td>${k === "actions" ? r[k] : esc(r[k])}</td>`).join("")}</tr>`).join("")}
+    ${rows.map((r) => `<tr>${keys.map((k) => `<td>${k === "actions" ? r[k] : esc(displayCell(k, r[k]))}</td>`).join("")}</tr>`).join("")}
   </tbody></table></div>`;
 }
 
@@ -1439,8 +1452,30 @@ function columnLabel(key) {
 
 function tableColumns(rows, keys) {
   return `<div class="table-wrap"><table><thead><tr>${keys.map((k) => `<th>${esc(columnLabel(k))}</th>`).join("")}</tr></thead><tbody>
-    ${rows.length ? rows.map((r) => `<tr>${keys.map((k) => `<td>${k === "actions" ? r[k] : esc(r[k] ?? "")}</td>`).join("")}</tr>`).join("") : `<tr><td colspan="${keys.length}">No records yet.</td></tr>`}
+    ${rows.length ? rows.map((r) => `<tr>${keys.map((k) => `<td>${k === "actions" ? r[k] : esc(displayCell(k, r[k]))}</td>`).join("")}</tr>`).join("") : `<tr><td colspan="${keys.length}">No records yet.</td></tr>`}
   </tbody></table></div>`;
+}
+
+function displayCell(key, value) {
+  if (value === "" || value == null) return "";
+  const keyName = String(key || "").toLowerCase();
+  if (
+    keyName === "id" ||
+    keyName.endsWith("_id") ||
+    keyName.includes("login") ||
+    keyName.includes("mobile") ||
+    keyName.includes("date") ||
+    keyName.includes("time") ||
+    keyName.includes("status") ||
+    keyName.includes("name") ||
+    keyName.includes("note") ||
+    keyName.includes("role")
+  ) {
+    return value;
+  }
+  if (typeof value === "number") return fmtNumber(value, 2);
+  if (typeof value === "string" && value.trim() !== "" && !Number.isNaN(Number(value))) return fmtNumber(value, 2);
+  return value;
 }
 
 function pageHead(title, crumb = "", action = "") {
@@ -1969,7 +2004,7 @@ function renderDayReport(day, rows) {
     },
     { ms_test: 0, ms_litres: 0, ms_sales: 0, hsd_test: 0, hsd_litres: 0, hsd_sales: 0, total_sales: 0 }
   );
-  const fmtNum = (value) => (value === "" || value == null ? "" : litres(value).toFixed(3).replace(/\.?0+$/, ""));
+  const fmtNum = (value) => fmtNumber(value, 2);
   const rowHtml = rows.map((row) => `
     <tr>
       <td><strong>${esc(row.pump)}</strong></td>
@@ -1987,7 +2022,7 @@ function renderDayReport(day, rows) {
     </tr>`).join("");
   return `<section class="table-card"><div class="table-card-head"><div><h2>Day Report</h2><p>Owner account for ${esc(day.business_date)}. Independent of shifts and salespeople.</p></div><span class="badge">${esc(day.status)}</span></div>
     <div class="table-wrap"><table>
-      <thead><tr><th>Pump</th><th>MS opening</th><th>MS closing</th><th>MS test</th><th>MS litres</th><th>MS sales (${esc(money(day.ms_price).toFixed(2))})</th><th>HSD opening</th><th>HSD closing</th><th>HSD test</th><th>HSD litres</th><th>HSD sales (${esc(money(day.hsd_price).toFixed(2))})</th><th>Total sales</th></tr></thead>
+      <thead><tr><th>Pump</th><th>MS opening</th><th>MS closing</th><th>MS test</th><th>MS litres</th><th>MS sales (${esc(fmtNumber(money(day.ms_price), 2))})</th><th>HSD opening</th><th>HSD closing</th><th>HSD test</th><th>HSD litres</th><th>HSD sales (${esc(fmtNumber(money(day.hsd_price), 2))})</th><th>Total sales</th></tr></thead>
       <tbody>${rowHtml}<tr><td><strong>Total</strong></td><td></td><td></td><td><strong>${esc(fmtNum(totals.ms_test))}</strong></td><td><strong>${esc(fmtNum(totals.ms_litres))}</strong></td><td><strong>${esc(rs(totals.ms_sales))}</strong></td><td></td><td></td><td><strong>${esc(fmtNum(totals.hsd_test))}</strong></td><td><strong>${esc(fmtNum(totals.hsd_litres))}</strong></td><td><strong>${esc(rs(totals.hsd_sales))}</strong></td><td><strong>${esc(rs(totals.total_sales))}</strong></td></tr></tbody>
     </table></div></section>`;
 }
@@ -2012,7 +2047,7 @@ function renderDaySaleSnapshot(day, rows, previousTotals = null, title = "Daily 
   const previousSale = previousTotals ? Number(previousTotals.total_sales || 0) : 0;
   const saleDiff = previousTotals ? money(totals.total_sales - previousSale) : null;
   const diffText = saleDiff == null ? "No previous closed day" : `${saleDiff >= 0 ? "+" : ""}${rs(saleDiff)}`;
-  const fmtNum = (value) => (value === "" || value == null ? "" : litres(value).toFixed(3).replace(/\.?0+$/, ""));
+  const fmtNum = (value) => fmtNumber(value, 2);
   const rowsHtml = rows.map((row) => `
     <tr>
       <td><strong>${esc(row.pump)}</strong></td>
@@ -2031,8 +2066,8 @@ function renderDaySaleSnapshot(day, rows, previousTotals = null, title = "Daily 
   return `<section class="table-card">
     <div class="table-card-head"><div><h2>${esc(title)}</h2><p>${esc(day.business_date)} | Daily sale data, 6AM to 5:59AM</p></div><span class="badge">${esc(day.status)}</span></div>
     <section class="stat-grid report-strip">
-      <div class="stat"><span>MS price</span><strong>${esc(money(day.ms_price).toFixed(2))}</strong></div>
-      <div class="stat"><span>HSD price</span><strong>${esc(money(day.hsd_price).toFixed(2))}</strong></div>
+      <div class="stat"><span>MS price</span><strong>${esc(fmtNumber(money(day.ms_price), 2))}</strong></div>
+      <div class="stat"><span>HSD price</span><strong>${esc(fmtNumber(money(day.hsd_price), 2))}</strong></div>
       <div class="stat hero"><span>Total day sale</span><strong>${esc(rs(totals.total_sales))}</strong></div>
       <div class="stat"><span>Previous day diff</span><strong>${esc(diffText)}</strong></div>
     </section>
@@ -2192,7 +2227,7 @@ async function dashboardCreditRows(day) {
 }
 
 function renderDashboardPumpOwnerCards(dayRows = []) {
-  const fmtNum = (value) => (value === "" || value == null ? "" : litres(value).toFixed(3).replace(/\.?0+$/, ""));
+  const fmtNum = (value) => fmtNumber(value, 2);
   const cards = dayRows.map((row) => `
     <section class="table-card dashboard-pump-card">
       <div class="table-card-head"><div><h2>${esc(row.pump)}</h2><p>Owner day readings from day closing.</p></div></div>
@@ -2233,8 +2268,8 @@ function renderDashboardShiftPumpCards(day, rows = [], dayRows = []) {
             <td><a class="text-link" href="/reports?start=${esc(day.business_date)}&end=${esc(day.business_date)}&pump_id=${esc(row.pump_id)}&user_id=${esc(row.user_id)}">${esc(row.salesperson)}</a></td>
             <td>${esc(row.login_id || "")}</td>
             <td>${esc(row.time_in)}-${esc(row.time_out)}</td>
-            <td>${esc(litres(row.ms_litres).toFixed(3))}</td>
-            <td>${esc(litres(row.hsd_litres).toFixed(3))}</td>
+            <td>${esc(fmtNumber(litres(row.ms_litres), 2))}</td>
+            <td>${esc(fmtNumber(litres(row.hsd_litres), 2))}</td>
             <td>${esc(rs(row.sales))}</td>
           </tr>`).join("")
       : '<tr><td colspan="6">No closed shift entries for this pump.</td></tr>';
@@ -2877,15 +2912,15 @@ async function renderShiftClose(req, res, values = {}, error = "") {
       <label class="field"><span>Expense category</span><select name="expense_category">${DEFAULT_EXPENSE_CATEGORIES.map((c) => option(c, c, fieldValue(values, "expense_category", "Miscellaneous"))).join("")}</select></label>
       <div class="form-section"><strong>Live closing calculation</strong><small>Updates immediately from the closing readings and logged payments.</small></div>
       <section class="stat-grid span-2" id="closeCalc" data-calc="${esc(JSON.stringify(calcData))}">
-        <div class="stat"><span>MS litres</span><strong data-value="msLitres">0.000 L</strong></div>
-        <div class="stat"><span>MS sales</span><strong data-value="msSales">Rs. 0.00</strong></div>
-        <div class="stat"><span>HSD litres</span><strong data-value="hsdLitres">0.000 L</strong></div>
-        <div class="stat"><span>HSD sales</span><strong data-value="hsdSales">Rs. 0.00</strong></div>
-        <div class="stat hero"><span>Total sales</span><strong data-value="totalSales">Rs. 0.00</strong></div>
+        <div class="stat"><span>MS litres</span><strong data-value="msLitres">0 L</strong></div>
+        <div class="stat"><span>MS sales</span><strong data-value="msSales">₹ 0.00</strong></div>
+        <div class="stat"><span>HSD litres</span><strong data-value="hsdLitres">0 L</strong></div>
+        <div class="stat"><span>HSD sales</span><strong data-value="hsdSales">₹ 0.00</strong></div>
+        <div class="stat hero"><span>Total sales</span><strong data-value="totalSales">₹ 0.00</strong></div>
         <div class="stat"><span>Payment added</span><strong data-value="loggedPayment">${rs(loggedTotals.total)}</strong></div>
-        <div class="stat"><span>Paying now</span><strong data-value="closingPayment">Rs. 0.00</strong></div>
-        <div class="stat"><span>Balance to pay</span><strong data-value="balanceDue">Rs. 0.00</strong></div>
-        <div class="stat"><span>Shortage / Excess</span><strong data-value="shortageExcess">Rs. 0.00</strong></div>
+        <div class="stat"><span>Paying now</span><strong data-value="closingPayment">₹ 0.00</strong></div>
+        <div class="stat"><span>Balance to pay</span><strong data-value="balanceDue">₹ 0.00</strong></div>
+        <div class="stat"><span>Shortage / Excess</span><strong data-value="shortageExcess">₹ 0.00</strong></div>
       </section>
       <div class="form-section"><strong>Payment at closing</strong><small>Use this when the salesperson pays part or all of the balance during close.</small></div>
       <label class="field"><span>Amount paid now</span><input name="closing_payment_amount" type="number" step="0.01" value="${esc(fieldValue(values, "closing_payment_amount", ""))}"></label>
@@ -2893,11 +2928,11 @@ async function renderShiftClose(req, res, values = {}, error = "") {
       <label class="field span-2"><span>Payment note</span><input name="closing_payment_note" value="${esc(fieldValue(values, "closing_payment_note", "Paid during shift closing"))}"></label>
       <div class="form-section"><strong>6AM price split</strong><small>${priceSplit.hasBoundaryReadings ? `Split point: ${esc(priceSplit.boundaryDate)} 06:00 from day closing readings.` : "Available after day closing readings are saved for this pump."}</small></div>
       <section class="stat-grid span-2" id="priceSplitCalc">
-        <div class="stat"><span>MS before 6AM</span><strong data-value="msBefore6">0.000 L</strong><small data-value="msOldPrice">Old price</small></div>
-        <div class="stat"><span>MS after 6AM</span><strong data-value="msAfter6">0.000 L</strong><small data-value="msNewPrice">New price</small></div>
-        <div class="stat"><span>HSD before 6AM</span><strong data-value="hsdBefore6">0.000 L</strong><small data-value="hsdOldPrice">Old price</small></div>
-        <div class="stat"><span>HSD after 6AM</span><strong data-value="hsdAfter6">0.000 L</strong><small data-value="hsdNewPrice">New price</small></div>
-        <div class="stat hero"><span>Price difference</span><strong data-value="priceDifference">Rs. 0.00</strong></div>
+        <div class="stat"><span>MS before 6AM</span><strong data-value="msBefore6">0 L</strong><small data-value="msOldPrice">Old price</small></div>
+        <div class="stat"><span>MS after 6AM</span><strong data-value="msAfter6">0 L</strong><small data-value="msNewPrice">New price</small></div>
+        <div class="stat"><span>HSD before 6AM</span><strong data-value="hsdBefore6">0 L</strong><small data-value="hsdOldPrice">Old price</small></div>
+        <div class="stat"><span>HSD after 6AM</span><strong data-value="hsdAfter6">0 L</strong><small data-value="hsdNewPrice">New price</small></div>
+        <div class="stat hero"><span>Price difference</span><strong data-value="priceDifference">₹ 0.00</strong></div>
       </section>
       <label class="field span-2"><span><input name="record_salesperson_due" type="checkbox" value="1" checked> Record unpaid balance as salesperson due</span><small>If balance remains unpaid at close, it will appear in reports against this salesperson and date.</small></label>
       <label class="field span-2"><span>Due note</span><input name="salesperson_due_note" value="${esc(fieldValue(values, "salesperson_due_note", "Unpaid shift closing balance"))}"></label>
@@ -2914,8 +2949,9 @@ async function renderShiftClose(req, res, values = {}, error = "") {
           const el = calc.querySelector('[data-value="' + key + '"]');
           if (el) el.textContent = value;
         };
-        const rsFmt = (value) => "Rs. " + Number(value || 0).toFixed(2);
-        const ltrFmt = (value) => Number(value || 0).toFixed(3) + " L";
+        const numFmt = (value, digits) => Number(value || 0).toLocaleString("en-IN", { minimumFractionDigits: 0, maximumFractionDigits: digits });
+        const rsFmt = (value) => "₹ " + Number(value || 0).toLocaleString("en-IN", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+        const ltrFmt = (value) => numFmt(value, 2) + " L";
         function updateCloseCalc() {
           const msLitres = Math.max(0, (number("closing_MS") - Number(data.msOpening || 0)) - number("testing_MS"));
           const hsdLitres = Math.max(0, (number("closing_HSD") - Number(data.hsdOpening || 0)) - number("testing_HSD"));
