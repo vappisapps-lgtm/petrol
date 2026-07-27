@@ -1645,61 +1645,70 @@ app.get("/logout", async (req, res) => {
 
 app.get("/", requireLogin, async (req, res) => {
   const metrics = await dashboardMetrics();
-  if (!metrics.day) {
-    const closedDayTitle = metrics.latestClosedDay ? `${metrics.latestClosedDay.business_date} Sales Account` : "Date Sales Account";
-    const closedDayReport = renderDaySaleSnapshot(metrics.latestClosedDay, metrics.latestDayReport, metrics.previousLatestTotals, closedDayTitle);
-    const closedShiftReport = renderShiftWiseSalesReport(metrics.latestClosedDay, metrics.latestShiftWiseReport);
+  const latestClosedDay = metrics.latestClosedDay;
+  if (!latestClosedDay) {
     return res.send(
       layout(
         req,
         "Dashboard",
         `${pageHead(`Welcome Back, ${req.user.name}`, "Home > Dashboard")}
-        ${closedDayReport || '<section class="table-card"><div class="table-card-head"><div><h2>Date Sales Account</h2><p>No closed day report is available yet.</p></div></div><div class="empty-state"><h2>No closed day</h2><p>Close a business day to see the owner account report here.</p></div></section>'}
-        ${closedShiftReport}
-        <section class="empty-state"><h2>No open business day</h2><p>Start a new business day when ready.</p><a class="primary link-button" href="/day/start">Start Day</a></section>`
+        <section class="empty-state"><h2>Ready for first business day</h2><p>Setup is ready. Start Day will let you enter the first date, prices and opening meter readings manually. The dashboard will show data after the first day is closed.</p><a class="primary link-button" href="/day/start">Start Day</a></section>`
       )
     );
   }
-  const m = metrics;
-  const openingRows = await dayOpeningRows(m.day.id);
-  const openEntries = groupPumpEntries(await all(
-    `SELECT se.business_date, p.id pump_id, p.name pump, se.product, u.name user_name, se.opening_meter, se.status, se.opened_at, se.closed_at
-     FROM shift_entries se
-     JOIN users u ON u.id=se.user_id
-     JOIN nozzles n ON n.id=se.nozzle_id
-     JOIN pumps p ON p.id=n.pump_id
-     WHERE se.day_id=? AND se.status='Open'
-     ORDER BY p.name, n.product, n.name`,
-    [m.day.id]
-  ));
+  const dayRows = metrics.latestDayReport || await dayReportRows(latestClosedDay.id);
+  const totals = dayReportTotals(dayRows);
+  const shiftRows = await dashboardShiftPersonRows(latestClosedDay.id);
+  const shiftTotals = shiftRows.reduce(
+    (acc, row) => {
+      acc.ms_litres = litres(acc.ms_litres + Number(row.ms_litres || 0));
+      acc.hsd_litres = litres(acc.hsd_litres + Number(row.hsd_litres || 0));
+      acc.sales = money(acc.sales + Number(row.sales || 0));
+      return acc;
+    },
+    { ms_litres: 0, hsd_litres: 0, sales: 0 }
+  );
+  const paymentTotals = await all(
+    `SELECT sp.payment_type, COALESCE(SUM(sp.amount),0) amount
+     FROM shift_payments sp
+     JOIN shift_entries se ON se.id=sp.shift_entry_id
+     WHERE se.day_id=?
+     GROUP BY sp.payment_type
+     ORDER BY sp.payment_type`,
+    [latestClosedDay.id]
+  );
+  const creditRows = await dashboardCreditRows(latestClosedDay);
+  const creditTotal = money(creditRows.reduce((sum, row) => sum + Number(row.amount || 0), 0));
+  const activeContext = metrics.day
+    ? `<span class="badge">Open day ${esc(metrics.day.business_date)}</span>`
+    : '<a class="secondary link-button" href="/day/start">Start Day</a>';
+  const titleDate = `${latestClosedDay.business_date} Sales Account`;
+  const closingContext = `${latestClosedDay.business_date} daily sales, closed on ${addDaysIso(latestClosedDay.business_date, 1)}`;
   res.send(
     layout(
       req,
       "Dashboard",
-      `${pageHead(`Welcome Back, ${req.user.name}`, "Home > Dashboard", '<div style="display:flex;gap:8px;"><a class="primary link-button" href="/shift/start">Start Shift</a><a class="link-button" href="/shifts/active">Active Shifts</a></div>')}
+      `${pageHead(titleDate, "Home > Dashboard", `<div style="display:flex;gap:8px;align-items:center;">${activeContext}<a class="primary link-button" href="/shift/start">Start Shift</a><a class="link-button" href="/reports?start=${esc(latestClosedDay.business_date)}&end=${esc(latestClosedDay.business_date)}">Full Report</a></div>`)}
       <section class="stat-grid">
-        <div class="stat hero"><span>${esc(m.day.business_date)} sales account</span><strong>${rs(m.totals.sales)}</strong><small>${esc(m.day.status)}</small></div>
-        <div class="stat"><span>MS / HSD litres</span><strong>${ltr(m.totals.ms_litres)} / ${ltr(m.totals.hsd_litres)}</strong><small>Closed shifts only</small></div>
-        <div class="stat"><span>Collections</span><strong>${rs(Number(m.totals.cash || 0) + Number(m.totals.upi || 0))}</strong><small>Cash + Phone Pay</small></div>
-        <div class="stat"><span>Dues / Open pumps</span><strong>${rs(m.credit_pending)}</strong><small>${esc(m.open_shifts)} open pumps</small></div>
+        <div class="stat hero"><span>${esc(latestClosedDay.business_date)} sales account</span><strong>${esc(rs(totals.total_sales))}</strong><small>${esc(closingContext)}</small></div>
+        <div class="stat"><span>MS / HSD litres</span><strong>${esc(ltr(totals.ms_litres))} / ${esc(ltr(totals.hsd_litres))}</strong><small>Day closing readings</small></div>
+        <div class="stat"><span>MS sales / HSD sales</span><strong>${esc(rs(totals.ms_sales))} / ${esc(rs(totals.hsd_sales))}</strong><small>Owner day account</small></div>
+        <div class="stat"><span>Credit</span><strong>${esc(rs(creditTotal))}</strong><small>${esc(latestClosedDay.business_date)} dues</small></div>
       </section>
-      <section class="table-card"><div class="table-card-head"><div><h2>${esc(m.day.business_date)} Open Day Readings</h2><p>Opening readings are captured. Final sale values appear after day close.</p></div><span class="badge">${esc(m.day.business_date)}</span></div>${tableColumns(openingRows, ["business_date", "pump", "ms_opening", "ms_closing", "hsd_opening", "hsd_closing"])}</section>
-      <section class="table-card"><div class="table-card-head"><div><h2>Active Pump Handover</h2><p>Who is currently responsible for each open pump.</p></div><span class="badge">${esc(m.open_shifts)} open</span></div>${tableColumns(openEntries, ["business_date", "pump", "user_name", "shift_name", "time_in", "ms_opening", "hsd_opening", "status"])}</section>
-      <section class="dashboard-grid">
-        <div class="panel wide"><div class="panel-title"><h2>Fuel Sales Summary</h2><span class="badge">${esc(m.day.status)}</span></div>
+      ${renderDashboardPumpOwnerCards(dayRows)}
+      <section class="dashboard-window-grid">
+        <div class="panel"><div class="panel-title"><h2>Entry Sales Summary</h2><span class="badge">${esc(latestClosedDay.business_date)}</span></div>
           <div class="mini-grid">
-            <article><strong>MS litres</strong><span>${ltr(m.totals.ms_litres)}</span></article>
-            <article><strong>MS sales</strong><span>${rs(m.totals.ms_sales)}</span></article>
-            <article><strong>HSD litres</strong><span>${ltr(m.totals.hsd_litres)}</span></article>
-            <article><strong>HSD sales</strong><span>${rs(m.totals.hsd_sales)}</span></article>
+            <article><strong>MS litres</strong><span>${esc(ltr(shiftTotals.ms_litres))}</span></article>
+            <article><strong>HSD litres</strong><span>${esc(ltr(shiftTotals.hsd_litres))}</span></article>
+            <article><strong>Shift sales</strong><span>${esc(rs(shiftTotals.sales))}</span></article>
+            <article><strong>Entries</strong><span>${esc(shiftRows.length)}</span></article>
           </div>
         </div>
-        <div class="panel"><div class="panel-title"><h2>Payment Split</h2></div>${m.payment_totals.map((r) => `<div class="ledger-line"><span>${esc(r.payment_type || "Unsorted")}</span><strong>${rs(r.amount)}</strong></div>`).join("") || '<p class="muted">No shift payments logged yet.</p>'}</div>
-        <div class="panel"><div class="panel-title"><h2>Credit / Dues</h2></div>${m.top_customers.map((c) => `<div class="ledger-line"><span>${esc(c.name)}</span><strong>${rs(c.balance)}</strong></div>`).join("") || '<p class="muted">No pending customer credit.</p>'}</div>
-        <div class="panel wide"><div class="panel-title"><h2>Salesperson Summary</h2></div>${tableColumns(m.boy_sales, ["person", "login_id", "pump", "ms_litres", "hsd_litres", "sales"])}</div>
-        ${renderDaySaleSnapshot(m.latestClosedDay, m.latestDayReport, m.previousLatestTotals, m.latestClosedDay ? `${m.latestClosedDay.business_date} Sales Account` : "Date Sales Account")}
-        ${renderShiftWiseSalesReport(m.latestClosedDay, m.latestShiftWiseReport)}
-      </section>`
+        <div class="panel"><div class="panel-title"><h2>Payment Split</h2></div>${paymentTotals.map((r) => `<div class="ledger-line"><span>${esc(r.payment_type || "Unsorted")}</span><strong>${esc(rs(r.amount))}</strong></div>`).join("") || '<p class="muted">No shift payments logged for this sales date.</p>'}</div>
+      </section>
+      ${renderDashboardShiftPumpCards(latestClosedDay, shiftRows)}
+      ${renderDashboardCreditCard(latestClosedDay, creditRows)}`
     )
   );
 });
@@ -2142,6 +2151,93 @@ function renderShiftWiseSalesReport(day, rows) {
   return `<section class="table-card"><div class="table-card-head"><div><h2>Shift-wise Sales Report</h2><p>Sales by shift, pump and salesperson for ${esc(day.business_date)}.</p></div></div>${tableColumns(rows || [], ["business_date", "shift", "time_in", "time_out", "pump", "salesperson", "login_id", "ms_litres", "ms_sales", "hsd_litres", "hsd_sales", "total_sales"])}</section>`;
 }
 
+async function dashboardShiftPersonRows(dayId) {
+  const shiftDefs = await all("SELECT * FROM shift_defs WHERE status='Active' ORDER BY start_time");
+  const rows = await all(
+    `SELECT se.business_date, p.id pump_id, p.name pump, u.id user_id, u.name salesperson, u.mobile login_id,
+     MIN(se.opened_at) opened_at, MAX(se.closed_at) closed_at,
+     COALESCE(SUM(CASE WHEN se.product='MS' THEN se.litres_sold ELSE 0 END),0) ms_litres,
+     COALESCE(SUM(CASE WHEN se.product='HSD' THEN se.litres_sold ELSE 0 END),0) hsd_litres,
+     COALESCE(SUM(se.sales_amount),0) sales
+     FROM shift_entries se
+     JOIN users u ON u.id=se.user_id
+     JOIN nozzles n ON n.id=se.nozzle_id
+     JOIN pumps p ON p.id=n.pump_id
+     WHERE se.day_id=? AND se.status='Closed'
+     GROUP BY se.business_date, p.id, p.name, u.id, u.name, u.mobile, se.opened_at, se.closed_at
+     ORDER BY ${pumpOrderSql("p")}, opened_at, u.name`,
+    [dayId]
+  );
+  return rows.map((row) => ({
+    ...row,
+    shift: matchedShiftName(row.opened_at, row.closed_at, shiftDefs),
+    time_in: clockFromTimestamp(row.opened_at),
+    time_out: clockFromTimestamp(row.closed_at),
+  }));
+}
+
+async function dashboardCreditRows(day) {
+  if (!day) return [];
+  return await all(
+    `SELECT c.name customer, COALESCE(SUM(cl.amount),0) amount
+     FROM credit_ledger cl
+     JOIN customers c ON c.id=cl.customer_id
+     WHERE cl.business_date=? AND cl.entry_type='credit'
+     GROUP BY c.id, c.name
+     HAVING COALESCE(SUM(cl.amount),0) <> 0
+     ORDER BY amount DESC, c.name
+     LIMIT 8`,
+    [day.business_date]
+  );
+}
+
+function renderDashboardPumpOwnerCards(dayRows = []) {
+  const fmtNum = (value) => (value === "" || value == null ? "" : litres(value).toFixed(3).replace(/\.?0+$/, ""));
+  const cards = dayRows.map((row) => `
+    <section class="table-card dashboard-pump-card">
+      <div class="table-card-head"><div><h2>${esc(row.pump)}</h2><p>Owner day readings from day closing.</p></div></div>
+      <div class="table-wrap"><table>
+        <thead><tr><th>Product</th><th>Opening</th><th>Closing</th><th>Testing</th><th>Litres</th><th>Amount</th></tr></thead>
+        <tbody>
+          <tr><td><strong>MS</strong></td><td>${esc(fmtNum(row.ms_opening))}</td><td>${esc(fmtNum(row.ms_closing))}</td><td>${esc(fmtNum(row.ms_test))}</td><td><strong>${esc(fmtNum(row.ms_litres))}</strong></td><td>${esc(rs(row.ms_sales))}</td></tr>
+          <tr><td><strong>HSD</strong></td><td>${esc(fmtNum(row.hsd_opening))}</td><td>${esc(fmtNum(row.hsd_closing))}</td><td>${esc(fmtNum(row.hsd_test))}</td><td><strong>${esc(fmtNum(row.hsd_litres))}</strong></td><td>${esc(rs(row.hsd_sales))}</td></tr>
+        </tbody>
+      </table></div>
+    </section>`).join("");
+  return `<section class="dashboard-pump-grid">${cards || '<section class="table-card"><div class="table-card-head"><div><h2>Pump Day Sales</h2><p>No closed pump readings for this date.</p></div></div></section>'}</section>`;
+}
+
+function renderDashboardShiftPumpCards(day, rows = []) {
+  const grouped = new Map();
+  for (const row of rows) {
+    if (!grouped.has(row.pump_id)) grouped.set(row.pump_id, []);
+    grouped.get(row.pump_id).push(row);
+  }
+  const cards = Array.from(grouped.entries()).map(([_pumpId, pumpRows]) => `
+    <section class="table-card dashboard-pump-card">
+      <div class="table-card-head"><div><h2>${esc(pumpRows[0]?.pump || "Pump")}</h2><p>Closed shift entries for ${esc(day.business_date)}.</p></div></div>
+      <div class="table-wrap"><table>
+        <thead><tr><th>Person</th><th>Login ID</th><th>Time</th><th>MS litres</th><th>HSD litres</th><th>Sales</th></tr></thead>
+        <tbody>${pumpRows.map((row) => `
+          <tr>
+            <td><a class="text-link" href="/reports?start=${esc(day.business_date)}&end=${esc(day.business_date)}&pump_id=${esc(row.pump_id)}&user_id=${esc(row.user_id)}">${esc(row.salesperson)}</a></td>
+            <td>${esc(row.login_id || "")}</td>
+            <td>${esc(row.time_in)}-${esc(row.time_out)}</td>
+            <td>${esc(litres(row.ms_litres).toFixed(3))}</td>
+            <td>${esc(litres(row.hsd_litres).toFixed(3))}</td>
+            <td>${esc(rs(row.sales))}</td>
+          </tr>`).join("")}</tbody>
+      </table></div>
+    </section>`).join("");
+  return `<section class="dashboard-pump-grid">${cards || '<section class="table-card"><div class="table-card-head"><div><h2>Salesperson Pump Sales</h2><p>No closed shift entries for this sales date.</p></div></div></section>'}</section>`;
+}
+
+function renderDashboardCreditCard(day, rows = []) {
+  return `<section class="panel dashboard-credit"><div class="panel-title"><div><h2>Credit / Dues</h2><p class="muted">Credit report data for ${esc(day.business_date)}.</p></div></div>
+    ${rows.map((row) => `<div class="ledger-line"><span>${esc(row.customer)}</span><strong>${esc(rs(row.amount))}</strong></div>`).join("") || '<p class="muted">No credit dues for this sales date.</p>'}
+  </section>`;
+}
+
 function shiftAccountabilityRows(rows = []) {
   return rows.map((row) => {
     const collection = money(Number(row.cash || 0) + Number(row.phone_pay || row.upi || 0) + Number(row.beta || 0) + Number(row.miscellaneous || 0));
@@ -2364,6 +2460,7 @@ async function renderShiftStart(req, res, values = {}, error = "") {
   res.send(layout(req, "Start Shift", `${pageHead("Start Shift", "Operations > Start Shift")}
     <section class="form-card"><form method="post" class="grid-form">
       ${inlineError(error)}
+      <label class="field"><span>Business date / shift date</span><input type="text" value="${esc(day.business_date)}" readonly><small>From the active business day.</small></label>
       <label class="field"><span>Pump</span><select name="pump_id" onchange="if(!this.selectedOptions[0].disabled) window.location='/shift/start?pump_id='+this.value">${pumps.map((p) => optionDisabled(p.id, activePumpIds.has(Number(p.id)) ? `${p.name} - active` : p.name, selectedPumpId, activePumpIds.has(Number(p.id)))).join("")}</select></label>
       <label class="field"><span>Team member</span><select name="user_id">${users.map((u) => optionDisabled(u.id, activeUserIds.has(Number(u.id)) ? `${u.name} - assigned` : u.name, selectedUserId, activeUserIds.has(Number(u.id)))).join("")}</select></label>
       <label class="field"><span>Time in</span><input name="time_in" type="time" value="${esc(fieldValue(values, "time_in", nowTimeIst()))}"></label>
