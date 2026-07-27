@@ -1694,6 +1694,8 @@ app.get("/", requireLogin, async (req, res) => {
   const dayRows = metrics.latestDayReport || await dayReportRows(latestClosedDay.id);
   const totals = dayReportTotals(dayRows);
   const shiftRows = await dashboardShiftPersonRows(latestClosedDay.id);
+  const previousAccountDay = await previousClosedDay(latestClosedDay.business_date);
+  const previousAccountRows = previousAccountDay ? await dashboardAccountRows(previousAccountDay.id) : [];
   const accountRows = await dashboardAccountRows(latestClosedDay.id);
   const shiftTotals = shiftRows.reduce(
     (acc, row) => {
@@ -1733,7 +1735,7 @@ app.get("/", requireLogin, async (req, res) => {
       </section>
       ${renderDashboardPumpOwnerCards(dayRows)}
       ${renderDashboardTimeSlotPanel(latestClosedDay, shiftRows, dayRows)}
-      ${renderDashboardAccountTable(latestClosedDay, accountRows)}
+      ${renderDashboardAccountTables(previousAccountDay, previousAccountRows, latestClosedDay, accountRows)}
       <section class="dashboard-window-grid">
         <div class="panel"><div class="panel-title"><h2>Entry Sales Summary</h2><span class="badge">${esc(latestClosedDay.business_date)}</span></div>
           <div class="mini-grid">
@@ -2374,7 +2376,7 @@ async function dashboardAccountRows(dayId) {
   });
 }
 
-function renderDashboardAccountTable(day, rows = []) {
+function renderDashboardAccountTable(day, rows = [], title = "Detailed Daily Account") {
   const totals = rows.reduce(
     (acc, row) => {
       acc.pump_net_volume = litres(acc.pump_net_volume + Number(row.pump_net_volume || 0));
@@ -2410,9 +2412,16 @@ function renderDashboardAccountTable(day, rows = []) {
     balance_cash: totals.balance_cash,
   }] : []);
   return `<section class="table-card dashboard-account-table">
-    <div class="table-card-head account-title"><div><h2>Detailed Daily Account</h2><p>Dt: ${esc(dateSlash(day.business_date))} Account</p></div></div>
+    <div class="table-card-head account-title"><div><h2>${esc(title)}</h2><p>Dt: ${esc(dateSlash(day.business_date))} Account</p></div></div>
     ${tableColumns(tableRows, ["no", "details", "name", "pump_reading_duty_down", "pump_reading_duty_up", "pump_net_volume", "test_volume", "gross_sale_litres", "rate_per_litre", "amount", "cash_deposits", "phone_pay", "swiping", "ppp", "others", "balance_cash"])}
   </section>`;
+}
+
+function renderDashboardAccountTables(previousDay, previousRows, currentDay, currentRows) {
+  const previous = previousDay
+    ? renderDashboardAccountTable(previousDay, previousRows, "Previous Detailed Account")
+    : "";
+  return `${previous}${renderDashboardAccountTable(currentDay, currentRows, "Detailed Daily Account")}`;
 }
 
 function renderDashboardShiftPumpCards(day, rows = [], dayRows = []) {
