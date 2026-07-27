@@ -1732,7 +1732,7 @@ app.get("/", requireLogin, async (req, res) => {
         <div class="stat"><span>Credit</span><strong>${esc(rs(creditTotal))}</strong><small>${esc(latestClosedDay.business_date)} dues</small></div>
       </section>
       ${renderDashboardPumpOwnerCards(dayRows)}
-      ${renderDashboardTimeSlotCards(latestClosedDay, shiftRows, dayRows)}
+      ${renderDashboardTimeSlotPanel(latestClosedDay, shiftRows, dayRows)}
       ${renderDashboardAccountTable(latestClosedDay, accountRows)}
       <section class="dashboard-window-grid">
         <div class="panel"><div class="panel-title"><h2>Entry Sales Summary</h2><span class="badge">${esc(latestClosedDay.business_date)}</span></div>
@@ -2277,6 +2277,33 @@ function compactTime(value) {
   return String(hour);
 }
 
+function renderDashboardTimeSlotPanel(day, rows = [], dayRows = []) {
+  const grouped = new Map();
+  for (const row of rows) {
+    if (!grouped.has(row.pump_id)) grouped.set(row.pump_id, []);
+    grouped.get(row.pump_id).push(row);
+  }
+  const cards = dashboardPumpList(rows, dayRows).map((pump) => {
+    const pumpRows = grouped.get(pump.pump_id) || [];
+    const slots = pumpRows.length
+      ? pumpRows.map((row) => {
+        const label = `${ordinalDayFromTimestamp(row.opened_at, day.business_date)} ${compactTime(row.time_in)} to ${compactTime(row.time_out)} Sales`;
+        return `<article class="dashboard-slot-card">
+          <div><strong>${esc(label)}</strong><span>Entry sales</span></div>
+          <div><b>MS</b> ${esc(ltr(row.ms_litres))}</div>
+          <div><b>HSD</b> ${esc(ltr(row.hsd_litres))}</div>
+          <div><strong>${esc(rs(row.sales))}</strong></div>
+        </article>`;
+      }).join("")
+      : `<article class="dashboard-slot-card is-empty"><div><strong>No entry sales</strong><span>Closed shift data</span></div><div><b>MS</b> 0 L</div><div><b>HSD</b> 0 L</div><div><strong>${esc(rs(0))}</strong></div></article>`;
+    return `<div class="dashboard-slot-column"><h3>${esc(pump.pump)}</h3>${slots}</div>`;
+  }).join("");
+  return `<section class="table-card dashboard-slot-panel">
+    <div class="table-card-head"><div><h2>Sales by Entry Window</h2><p>Actual closed shift entry windows for ${esc(day.business_date)}.</p></div></div>
+    <div class="dashboard-slot-shell">${cards || `<div class="dashboard-slot-column"><h3>Pump sales</h3><article class="dashboard-slot-card is-empty"><div><strong>No entry sales</strong><span>Closed shift data</span></div><div><b>MS</b> 0 L</div><div><b>HSD</b> 0 L</div><div><strong>${esc(rs(0))}</strong></div></article></div>`}</div>
+  </section>`;
+}
+
 function renderDashboardTimeSlotCards(day, rows = [], dayRows = []) {
   const grouped = new Map();
   for (const row of rows) {
@@ -2383,7 +2410,7 @@ function renderDashboardAccountTable(day, rows = []) {
     balance_cash: totals.balance_cash,
   }] : []);
   return `<section class="table-card dashboard-account-table">
-    <div class="table-card-head account-title"><h2>Dt: ${esc(dateSlash(day.business_date))} Account</h2></div>
+    <div class="table-card-head account-title"><div><h2>Detailed Daily Account</h2><p>Dt: ${esc(dateSlash(day.business_date))} Account</p></div></div>
     ${tableColumns(tableRows, ["no", "details", "name", "pump_reading_duty_down", "pump_reading_duty_up", "pump_net_volume", "test_volume", "gross_sale_litres", "rate_per_litre", "amount", "cash_deposits", "phone_pay", "swiping", "ppp", "others", "balance_cash"])}
   </section>`;
 }
