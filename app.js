@@ -1694,8 +1694,7 @@ app.get("/", requireLogin, async (req, res) => {
   const dayRows = metrics.latestDayReport || await dayReportRows(latestClosedDay.id);
   const totals = dayReportTotals(dayRows);
   const shiftRows = await dashboardShiftPersonRows(latestClosedDay.id);
-  const previousAccountDay = await previousClosedDay(latestClosedDay.business_date);
-  const splitAccountRows = await dashboardSixAmAccountRows(previousAccountDay, latestClosedDay);
+  const splitAccountRows = await dashboardSixAmAccountRows(latestClosedDay);
   const shiftTotals = shiftRows.reduce(
     (acc, row) => {
       acc.ms_litres = litres(acc.ms_litres + Number(row.ms_litres || 0));
@@ -1733,7 +1732,7 @@ app.get("/", requireLogin, async (req, res) => {
         <div class="stat"><span>Credit</span><strong>${esc(rs(creditTotal))}</strong><small>${esc(latestClosedDay.business_date)} dues</small></div>
       </section>
       ${renderDashboardPumpOwnerCards(dayRows)}
-      ${renderDashboardSixAmAccountTables(previousAccountDay, latestClosedDay, splitAccountRows)}
+      ${renderDashboardSixAmAccountTables(latestClosedDay, splitAccountRows)}
       <section class="dashboard-window-grid">
         <div class="panel"><div class="panel-title"><h2>Entry Sales Summary</h2><span class="badge">${esc(latestClosedDay.business_date)}</span></div>
           <div class="mini-grid">
@@ -2374,21 +2373,25 @@ async function dashboardAccountRows(dayId) {
   });
 }
 
-async function dashboardSixAmAccountRows(previousDay, currentDay) {
-  if (!previousDay || !currentDay) return { before: [], after: [] };
-  const boundary = `${currentDay.business_date} 06:00:00`;
+async function dashboardSixAmAccountRows(day) {
+  if (!day) return { early: [], main: [] };
+  const nightStart = `${addDaysIso(day.business_date, -1)} 21:00:00`;
+  const earlyStart = `${day.business_date} 06:00:00`;
+  const earlyEnd = `${day.business_date} 09:00:00`;
   const rows = await all(
-    `SELECT se.id, se.business_date, se.product, se.opened_at, se.closed_at, se.opening_meter, se.closing_meter,
+    `SELECT se.id, se.day_id, se.business_date, se.product, se.opened_at, se.closed_at, se.opening_meter, se.closing_meter,
      se.testing_qty, se.litres_sold, se.rate, se.sales_amount, se.cash, se.upi, se.card, se.credit,
      se.beta, se.miscellaneous, se.shortage_excess, p.name pump, u.name salesperson, dnr.closing_meter boundary_meter
      FROM shift_entries se
      JOIN users u ON u.id=se.user_id
      JOIN nozzles n ON n.id=se.nozzle_id
      JOIN pumps p ON p.id=n.pump_id
-     LEFT JOIN day_nozzle_readings dnr ON dnr.day_id=? AND dnr.nozzle_id=se.nozzle_id
-     WHERE se.day_id=? AND se.status='Closed'
-     ORDER BY ${pumpOrderSql("p")}, se.opened_at, se.product`,
-    [previousDay.id, previousDay.id]
+     LEFT JOIN day_nozzle_readings dnr ON dnr.day_id=se.day_id AND dnr.nozzle_id=se.nozzle_id
+     WHERE se.status='Closed'
+       AND se.opened_at < ?
+       AND se.closed_at > ?
+     ORDER BY se.opened_at, ${pumpOrderSql("p")}, se.product`,
+    [earlyEnd, nightStart]
   );
   const makeRow = (row, index, opening, closing, testVolume, rate, amount, ratio) => {
     const netVolume = litres(Math.max(0, closing - opening));
@@ -2413,27 +2416,45 @@ async function dashboardSixAmAccountRows(previousDay, currentDay) {
       balance_cash: balance,
     };
   };
-  const before = [];
-  const after = [];
+  const segments = [];
   for (const row of rows) {
-    if (!row.closed_at || !row.closing_meter || row.boundary_meter == null) continue;
-    if (!(normalizeTimestamp(row.opened_at) < boundary && normalizeTimestamp(row.closed_at) > boundary)) continue;
-    const opening = Number(row.opening_meter || 0);
-    const boundaryMeter = Number(row.boundary_meter || 0);
-    const closing = Number(row.closing_meter || 0);
+    const openedAt = normalizeTimestamp(row.opened_at);
+    const closedAt = normalizeTimestamp(row.closed_at);
+    const opening = meterOrNull(row.opening_meter);
+    const closing = meterOrNull(row.closing_meter);
+    if (!openedAt || !closedAt || opening == null || closing == null) continue;
+    const boundary = `${addDaysIso(row.business_date, 1)} 06:00:00`;
+    const boundaryMeter = meterOrNull(row.boundary_meter);
     const testVolume = litres(row.testing_qty || 0);
-    const beforeNet = litres(Math.max(0, boundaryMeter - opening));
-    const beforeGross = litres(Math.max(0, beforeNet - testVolume));
-    const afterGross = litres(Math.max(0, closing - boundaryMeter));
-    const oldRate = productPrice(previousDay, row.product);
-    const newRate = productPrice(currentDay, row.product);
-    const beforeAmount = money(beforeGross * oldRate);
-    const afterAmount = money(afterGross * newRate);
-    const totalAmount = Math.max(0.01, beforeAmount + afterAmount);
-    before.push(makeRow(row, before.length + 1, opening, boundaryMeter, testVolume, oldRate, beforeAmount, beforeAmount / totalAmount));
-    after.push(makeRow(row, after.length + 1, boundaryMeter, closing, 0, newRate, afterAmount, afterAmount / totalAmount));
+    const totalGross = Math.max(0.01, Number(row.litres_sold || Math.max(0, closing - opening - testVolume)));
+    if (openedAt < boundary && closedAt > boundary && boundaryMeter != null) {
+      const beforeRate = money(row.rate || 0);
+      const afterRate = money(productPrice(day, row.product));
+      const beforeNet = litres(Math.max(0, boundaryMeter - opening));
+      const beforeGross = litres(Math.max(0, beforeNet - testVolume));
+      const afterGross = litres(Math.max(0, closing - boundaryMeter));
+      const beforeAmount = money(beforeGross * beforeRate);
+      const afterAmount = money(afterGross * afterRate);
+      const totalAmount = Math.max(0.01, beforeAmount + afterAmount);
+      segments.push({ row, start: openedAt, end: boundary, opening, closing: boundaryMeter, testVolume, rate: beforeRate, amount: beforeAmount, ratio: beforeAmount / totalAmount });
+      segments.push({ row, start: boundary, end: closedAt, opening: boundaryMeter, closing, testVolume: 0, rate: afterRate, amount: afterAmount, ratio: afterAmount / totalAmount });
+    } else {
+      const rate = money(row.rate || productPrice(day, row.product));
+      const grossSale = litres(Math.max(0, closing - opening - testVolume));
+      segments.push({ row, start: openedAt, end: closedAt, opening, closing, testVolume, rate, amount: money(row.sales_amount || grossSale * rate), ratio: 1 });
+    }
   }
-  return { before, after };
+  const early = [];
+  const main = [];
+  for (const segment of segments) {
+    if (segment.end <= nightStart || segment.start >= earlyEnd) continue;
+    if (segment.end > earlyStart && segment.start < earlyEnd) {
+      early.push(makeRow(segment.row, early.length + 1, segment.opening, segment.closing, segment.testVolume, segment.rate, segment.amount, segment.ratio));
+    } else if (segment.end > nightStart && segment.start < earlyStart) {
+      main.push(makeRow(segment.row, main.length + 1, segment.opening, segment.closing, segment.testVolume, segment.rate, segment.amount, segment.ratio));
+    }
+  }
+  return { early, main };
 }
 
 function renderDashboardAccountTable(day, rows = [], title = "Detailed Daily Account") {
@@ -2484,11 +2505,10 @@ function renderDashboardAccountTables(previousDay, previousRows, currentDay, cur
   return `${previous}${renderDashboardAccountTable(currentDay, currentRows, "Detailed Daily Account")}`;
 }
 
-function renderDashboardSixAmAccountTables(previousDay, currentDay, splitRows) {
-  if (!previousDay) return renderDashboardAccountTable(currentDay, [], "6 AM Split Account");
-  const beforeTitle = `${dateSlash(previousDay.business_date)} 9 PM to 6 AM Account`;
-  const afterTitle = `${dateSlash(currentDay.business_date)} 6 AM to 9 AM Account`;
-  return `${renderDashboardAccountTable(previousDay, splitRows.before, beforeTitle)}${renderDashboardAccountTable(currentDay, splitRows.after, afterTitle)}`;
+function renderDashboardSixAmAccountTables(day, splitRows) {
+  const earlyTitle = `${dateSlash(day.business_date)} 6 AM to 9 AM Account`;
+  const mainTitle = `${dateSlash(day.business_date)} 9 PM to 6 AM Account`;
+  return `${renderDashboardAccountTable(day, splitRows.early, earlyTitle)}${renderDashboardAccountTable(day, splitRows.main, mainTitle)}`;
 }
 
 function renderDashboardShiftPumpCards(day, rows = [], dayRows = []) {
