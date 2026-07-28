@@ -2348,8 +2348,8 @@ async function dashboardSixAmAccountRows(day) {
   if (!day) return { early: [], main: [] };
   const earlyStart = `${day.business_date} 06:00:00`;
   const earlyEnd = `${day.business_date} 09:00:00`;
-  const nightStart = `${day.business_date} 21:00:00`;
-  const nightEnd = `${addDaysIso(day.business_date, 1)} 06:00:00`;
+  const mainStart = `${day.business_date} 09:00:00`;
+  const mainEnd = `${addDaysIso(day.business_date, 1)} 06:00:00`;
   const rows = await all(
     `SELECT se.id, se.day_id, se.business_date, se.product, se.opened_at, se.closed_at, se.opening_meter, se.closing_meter,
      se.testing_qty, se.litres_sold, se.rate, se.sales_amount, se.cash, se.upi, se.card, se.credit,
@@ -2364,7 +2364,7 @@ async function dashboardSixAmAccountRows(day) {
        AND se.opened_at < ?
        AND se.closed_at > ?
      ORDER BY se.opened_at, ${pumpOrderSql("p")}, se.product`,
-    [day.business_date, nightEnd, earlyStart]
+    [day.business_date, mainEnd, earlyStart]
   );
   const makeRow = (row, index, opening, closing, testVolume, rate, amount, ratio) => {
     const netVolume = litres(Math.max(0, closing - opening));
@@ -2421,11 +2421,11 @@ async function dashboardSixAmAccountRows(day) {
   const main = [];
   for (const segment of segments) {
     const overlapsEarly = segment.end > earlyStart && segment.start < earlyEnd;
-    const overlapsNight = segment.end > nightStart && segment.start < nightEnd;
-    if (!overlapsEarly && !overlapsNight) continue;
+    const overlapsMain = segment.end > mainStart && segment.start < mainEnd;
+    if (!overlapsEarly && !overlapsMain) continue;
     if (segment.end > earlyStart && segment.start < earlyEnd) {
       early.push(makeRow(segment.row, early.length + 1, segment.opening, segment.closing, segment.testVolume, segment.rate, segment.amount, segment.ratio));
-    } else if (segment.end > nightStart && segment.start < nightEnd) {
+    } else if (segment.end > mainStart && segment.start < mainEnd) {
       main.push(makeRow(segment.row, main.length + 1, segment.opening, segment.closing, segment.testVolume, segment.rate, segment.amount, segment.ratio));
     }
   }
@@ -2482,7 +2482,7 @@ function renderDashboardAccountTables(previousDay, previousRows, currentDay, cur
 
 function renderDashboardSixAmAccountTables(day, splitRows) {
   const earlyTitle = `${dateSlash(day.business_date)} 6 AM to 9 AM Account`;
-  const mainTitle = `${dateSlash(day.business_date)} 9 PM to ${dateSlash(addDaysIso(day.business_date, 1))} 6 AM Account`;
+  const mainTitle = `${dateSlash(day.business_date)} 9 AM to ${dateSlash(addDaysIso(day.business_date, 1))} 6 AM Account`;
   return `${renderDashboardAccountTable(day, splitRows.early, earlyTitle)}${renderDashboardAccountTable(day, splitRows.main, mainTitle)}`;
 }
 
